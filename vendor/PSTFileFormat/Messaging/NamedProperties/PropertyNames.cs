@@ -33,6 +33,7 @@ namespace PSTFileFormat
         public static readonly PropertyName PidLidBusyStatus = new PropertyName(PropertyLongID.PidLidBusyStatus, PropertySetGuid.PSETID_Appointment);
         public static readonly PropertyName PidLidFInvited = new PropertyName(PropertyLongID.PidLidFInvited, PropertySetGuid.PSETID_Appointment);
         public static readonly PropertyName PidLidAppointmentStateFlags = new PropertyName(PropertyLongID.PidLidAppointmentStateFlags, PropertySetGuid.PSETID_Appointment);
+        public static readonly PropertyName PidLidResponseStatus = new PropertyName(PropertyLongID.PidLidResponseStatus, PropertySetGuid.PSETID_Appointment);
         public static readonly PropertyName PidLidAppointmentRecur = new PropertyName(PropertyLongID.PidLidAppointmentRecur, PropertySetGuid.PSETID_Appointment);
         public static readonly PropertyName PidLidTimeZoneDescription = new PropertyName(PropertyLongID.PidLidTimeZoneDescription, PropertySetGuid.PSETID_Appointment);
         public static readonly PropertyName PidLidTimeZoneStruct = new PropertyName(PropertyLongID.PidLidTimeZoneStruct, PropertySetGuid.PSETID_Appointment);
@@ -45,5 +46,9 @@ namespace PSTFileFormat
         public static readonly PropertyName PidLidSendMeetingAsIcal = new PropertyName(PropertyLongID.PidLidSendMeetingAsIcal, PropertySetGuid.PSETID_Appointment);
         
         public static readonly PropertyName PidLidIsRecurring = new PropertyName(PropertyLongID.PidLidIsRecurring, PropertySetGuid.PSETID_Meeting);
+
+        // ContinuMail 2026 (PR7b): task recurrence props
+        public static readonly PropertyName PidLidTaskFRecurring = new PropertyName(PropertyLongID.PidLidTaskFRecurring, PropertySetGuid.PSETID_Task);
+        public static readonly PropertyName PidLidTaskRecurrence = new PropertyName(PropertyLongID.PidLidTaskRecurrence, PropertySetGuid.PSETID_Task);
     }
 }

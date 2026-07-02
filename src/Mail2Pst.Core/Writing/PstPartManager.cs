@@ -12,6 +12,9 @@ using PSTFileFormat;
 
 namespace Mail2Pst.Core.Writing;
 
+/// <summary>One folder to pre-create, with the leaf container class it must carry.</summary>
+internal readonly record struct FolderToPrecreate(IReadOnlyList<string> Path, FolderItemTypeName Type);
+
 /// <summary>
 /// Owns the output-PST part lifecycle for a single WritePlan call: the current PSTFile
 /// handle, part numbering, rename-on-first-split, the per-part folder cache, the per-part
@@ -28,6 +31,8 @@ internal sealed class PstPartManager
     private readonly int _checkIntervalMessages;
     private readonly Action<PSTFile, PSTFolder, MailMessage> _writeMessage;
     private readonly Action<PSTFile, PSTFolder, ContactRecord> _writeContact;
+    private readonly Action<PSTFile, PSTFolder, TaskRecord> _writeTask;
+    private readonly Action<PSTFile, PSTFolder, AppointmentRecord> _writeAppointment;
     private readonly long _emptyStoreSize;
 
     private readonly List<string> _outputFiles = new();
@@ -43,7 +48,9 @@ internal sealed class PstPartManager
     public PstPartManager(string groupName, string outputDirectory,
         long maxSizeBytes, int checkIntervalMessages,
         Action<PSTFile, PSTFolder, MailMessage> writeMessage,
-        Action<PSTFile, PSTFolder, ContactRecord> writeContact)
+        Action<PSTFile, PSTFolder, ContactRecord> writeContact,
+        Action<PSTFile, PSTFolder, TaskRecord>? writeTask = null,
+        Action<PSTFile, PSTFolder, AppointmentRecord>? writeAppointment = null)
     {
         _groupName = groupName;
         _outputDirectory = outputDirectory;
@@ -51,6 +58,8 @@ internal sealed class PstPartManager
         _checkIntervalMessages = checkIntervalMessages;
         _writeMessage = writeMessage;
         _writeContact = writeContact;
+        _writeTask = writeTask ?? ((_, _, _) => { });
+        _writeAppointment = writeAppointment ?? ((_, _, _) => { });
         // From-scratch creation (PSTFile.CreateEmptyStore) seeds every part; the template
         // copy is retired. The initial on-disk size is the constant empty-store size.
         _emptyStoreSize = PSTFile.EmptyStoreSizeBytes;
@@ -61,19 +70,15 @@ internal sealed class PstPartManager
     public bool CheckpointDue => _messagesSinceCheck >= _checkIntervalMessages;
 
     /// <summary>
-    /// Opens the first (un-suffixed) part, begins saving, and pre-creates the given folders
-    /// (the IncludeEmptyFolders set). Call exactly once, before the message loop.
+    /// Opens the first (un-suffixed) part, begins saving, and pre-creates the given folders with their
+    /// correct leaf item types (the IncludeEmptyFolders set + every contact/calendar/task target folder,
+    /// so an empty source still appears as an empty typed folder). Call exactly once, before the loop.
+    /// Validates the inventory FIRST, so a bad request throws before any PST file is created on disk.
     /// </summary>
-    public void Begin(IReadOnlyList<IReadOnlyList<string>> foldersToPrecreate) =>
-        Begin(foldersToPrecreate, Array.Empty<IReadOnlyList<string>>());
-
-    /// <summary>
-    /// Opens the first (un-suffixed) part, begins saving, and pre-creates the given mail and
-    /// contact folders with their correct item types. Call exactly once, before the message loop.
-    /// </summary>
-    public void Begin(IReadOnlyList<IReadOnlyList<string>> mailFolders,
-                      IReadOnlyList<IReadOnlyList<string>> contactFolders)
+    public void Begin(IReadOnlyList<FolderToPrecreate> foldersToPrecreate)
     {
+        ValidateFolderInventory(foldersToPrecreate);   // fail before touching the filesystem
+
         _currentPath = StartNewFile(_groupName, null, _outputDirectory);
         _outputFiles.Add(_currentPath);
         // Outlook2007RTM is load-bearing: it matches the compatibility mode CreateEmptyStore writes
@@ -81,10 +86,25 @@ internal sealed class PstPartManager
         // mismatch here corrupts the AMap marker; the IndependentValidationTests gate would catch it.
         _file = new PSTFile(_currentPath, FileAccess.ReadWrite, WriterCompatibilityMode.Outlook2007RTM);
         _file.BeginSavingChanges();
-        foreach (IReadOnlyList<string> path in mailFolders)
-            GetOrCreateFolder(path, FolderItemTypeName.Note);
-        foreach (IReadOnlyList<string> path in contactFolders)
-            GetOrCreateFolder(path, FolderItemTypeName.Contact);
+        foreach (FolderToPrecreate folder in foldersToPrecreate)
+            GetOrCreateFolder(folder.Path, folder.Type);   // GuardLeafClass is the second line of defense
+    }
+
+    // Pre-flight: reject an empty path or the same path requested as two different item types BEFORE any
+    // file is created, so a bad inventory never leaves a partial PST on disk.
+    private static void ValidateFolderInventory(IReadOnlyList<FolderToPrecreate> folders)
+    {
+        var seen = new Dictionary<string, FolderItemTypeName>(StringComparer.Ordinal);
+        foreach (FolderToPrecreate folder in folders)
+        {
+            if (folder.Path is null || folder.Path.Count == 0)
+                throw new ConfigValidationException("Folder path cannot be empty.");
+            string key = FolderPathKey.Join(folder.Path);
+            if (seen.TryGetValue(key, out FolderItemTypeName existing) && existing != folder.Type)
+                throw new ConfigValidationException(
+                    $"Folder '{string.Join("/", folder.Path)}' is requested as both {existing} and {folder.Type}.");
+            seen[key] = folder.Type;
+        }
     }
 
     public bool ShouldSplitBefore(long messageSize) =>
@@ -110,6 +130,20 @@ internal sealed class PstPartManager
     {
         PSTFolder folder = GetOrCreateFolder(path, FolderItemTypeName.Contact);
         _writeContact(_file!, folder, contact);
+        _dirtyFolders.Add(folder);
+    }
+
+    public void WriteTask(IReadOnlyList<string> path, TaskRecord task)
+    {
+        PSTFolder folder = GetOrCreateFolder(path, FolderItemTypeName.Task);
+        _writeTask(_file!, folder, task);
+        _dirtyFolders.Add(folder);
+    }
+
+    public void WriteAppointment(IReadOnlyList<string> path, AppointmentRecord appt)
+    {
+        PSTFolder folder = GetOrCreateFolder(path, FolderItemTypeName.Appointment);
+        _writeAppointment(_file!, folder, appt);
         _dirtyFolders.Add(folder);
     }
 

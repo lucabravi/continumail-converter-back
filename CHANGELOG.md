@@ -14,6 +14,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   supported. When you convert a Thunderbird profile, contacts are included automatically; a
   `--no-contacts` flag (and a future GUI toggle) opts out. Contacts land in an `IPF.Contact` folder per
   address book and validate cleanly in Outlook and `scanpst.exe`.
+- **Thunderbird to-dos now convert to PST.** Tasks from a Thunderbird calendar store
+  (`local.sqlite`/`cache.sqlite`) become Outlook tasks (`IPM.Task`) in a per-calendar Tasks folder,
+  carrying subject, start/due/completed dates, status, percent-complete, priority, sensitivity (incl.
+  Private), reminder, body, and categories. Tasks are included automatically when you convert a profile;
+  a `--no-tasks` flag opts out.
+- **Thunderbird calendar events now convert to PST.** Events from a Thunderbird calendar
+  store (`local.sqlite`/`cache.sqlite`) become Outlook appointments (`IPM.Appointment`) in a per-calendar
+  Calendar folder, carrying subject, start/end with **timezone**, **all-day**, location, busy/free, sensitivity
+  (incl. Private), importance, body (plain **and** HTML), categories, and reminder. Events are included
+  automatically when you convert a profile; a `--no-appointments` flag opts out.
+- **Meeting attendees now convert to PST appointment recipients.** Events with attendees become proper
+  Outlook meetings (`IPM.Appointment` with meeting-request state). Required, optional, and resource
+  attendees map to the correct MAPI recipient types (To/Cc/Bcc); the organizer is recorded in the
+  organizer field and as an organizer-copy recipient row. Per-attendee PARTSTAT (accepted/declined/tentative
+  etc.) maps to both `PidLidResponseStatus` and the track-status column on each recipient row.
+  Attendee-free events remain plain appointments (no meeting state, no extra properties).
+- **Recurring appointments now convert to PST.** Daily, weekly, monthly, and yearly recurrence rules
+  from Thunderbird calendar events become proper Outlook recurring appointments (`IPM.Appointment`)
+  with a `PidLidAppointmentRecur` blob. EXDATE-deleted occurrences are encoded as deleted-instance
+  dates. Overridden occurrences become embedded exception attachments (modified instances).
+  Timezone definitions (IANA → Windows mapping) are written to `PidLidTimeZoneStruct` and
+  `PidLidAppointmentTimeZoneDefinitionStartDisplay` so Outlook displays occurrences in the correct
+  local time. All-day recurring events carry both a recurrence blob and `PidLidAppointmentSubType`.
+  Unsupported patterns (BYSETPOS, multi-RRULE, etc.) degrade gracefully to a single occurrence with
+  a warning rather than being skipped.
+- **Recurring tasks now convert to PST.** Daily, weekly, monthly, and yearly recurring to-dos become
+  proper Outlook recurring tasks (`IPM.Task`) carrying a `PidLidTaskRecurrence` pattern, so Outlook
+  regenerates the next occurrence when you complete one. A recurring task with deleted or overridden
+  occurrences, a completed recurring task, or an unrepresentable rule is written as a single task with
+  a warning rather than being dropped.
+- **Calendar and task attachments now convert to PST.** File attachments on Thunderbird events and to-dos
+  are written into the appointment/task as normal Outlook attachments. Embedded/inline attachments are
+  decoded and attached; a **remote-URL** attachment (e.g. a Google-Drive link) is preserved as a link in
+  the item body — the converter **never fetches from the network**; and a **local-file** attachment is
+  embedded only when the file still exists and resolves **inside the Thunderbird profile** (symlinks and
+  out-of-profile paths are refused), otherwise its reference is preserved in the body with a warning.
+- **Online-meeting join links are preserved.** When a Thunderbird event carries a Microsoft Teams or
+  Google Meet link, the join URL is kept clickable in the appointment body. (Classic Outlook — which is
+  what opens a local PST — has no separate "Join" button; the link in the body is what actually works.)
+  Ordinary links in an event are left as-is and never misidentified as an online meeting.
+- **Cached Exchange meetings keep their identity.** For events synced from an Exchange/Microsoft 365
+  calendar, the meeting's global object identifier is carried across (`PidLidGlobalObjectId` /
+  `PidLidCleanGlobalObjectId`) so Outlook recognises it as the same meeting. Local calendar events are
+  unaffected — Outlook assigns identity on demand as usual.
+- **Item relations are preserved.** Thunderbird `RELATED-TO` links between calendar items — which have no
+  native Outlook equivalent — are preserved as a readable note appended to the item body, with a warning,
+  rather than being silently dropped.
 
 ### Internal
 - New contact pipeline (`ContactRecord` model, SQLite + Mork readers, a shared vCard mapper, and an
@@ -23,6 +70,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sparse card still yields a usable contact. Adds two pinned, GPL-compatible NuGet dependencies —
   `Microsoft.Data.Sqlite` and `FolkerKinzel.VCards` (both MIT-family) — recorded in `NOTICE`. The
   independent `pst-validate` round-trip gate now covers contact folders.
+- New task pipeline (`TaskRecord` model, `CalendarTaskMapper` over the SQLite calendar reader, an
+  `IPM.Task` vendor factory + `TaskWriter`) added as a distinct write phase reusing the shared
+  precreation / size-split / checkpoint / reporting machinery. The MAPI property recipe (absolute task
+  reminders, date-only start/due, the completed-task recipe, `PidLidPrivate` coupling, percent as
+  `PtypFloating64`, `Keywords` categories) was pinned against a real Outlook task export. The independent
+  `pst-validate` round-trip gate now covers `IPF.Task` folder counts.
+- New appointment pipeline (`AppointmentRecord` model, `CalendarEventMapper` over the SQLite calendar
+  reader, an `AppointmentWriter` driving the vendored `SingleAppointment` MS-OXOCAL substrate) added as a
+  distinct write phase reusing the shared precreation / size-split / checkpoint / reporting machinery. The
+  MAPI recipe (timezone-definition blobs, all-day local-midnight semantics, minutes-before reminder delta,
+  busy/free, `PidLidPrivate` coupling, HTML/ALTREP body) was pinned against a real Outlook appointment
+  export; timezones resolve cross-platform without the Win32 registry. The independent `pst-validate`
+  round-trip gate now covers `IPF.Appointment` folder counts.
+- Meeting attendee pipeline: `AppointmentAttendee`/`AttendeeKind`/`AttendeeResponse` model from
+  `cal_attendees` rows; `AppointmentWriter.WriteAttendees` sets recipient rows (`MAPI_TO`/`CC`/`BCC`),
+  organizer fields, meeting-request object type/subtype, and per-recipient track-status via a vendored
+  `PidLidResponseStatus` registration. Case-insensitive email dedup (attendees vs organizer). Attendee-only
+  events with no valid email are skipped with a warning; organizer-only events (zero attendees) remain
+  plain appointments. Received-meeting response status is deferred (requires identity resolution).
+- Recurrence pipeline: a shared `RecurrenceMapping` translates iCal `RRULE`/`EXDATE` into a typed
+  `RecurrenceSpec`, consumed by both the appointment writer (the full `PidLidAppointmentRecur` blob with
+  deleted/modified instances, embedded exception attachments, and IANA→Windows timezone definitions) and
+  the task writer (the bare MS-OXOCAL `RecurrencePattern` prefix for `PidLidTaskRecurrence` +
+  `PidLidTaskFRecurring`, split out of the vendored appointment serializer). Both blob encodings are
+  byte-gated against real Outlook ground-truth exports. Unrepresentable rules and task-level exceptions
+  (EXDATE/RDATE/overrides, completed-recurring) degrade to a single item plus a warning — counted as
+  converted, never silently dropped. The independent `pst-validate` gate confirms recurrence adds no
+  phantom folder items.
+- Edge-fidelity pipeline: the mail and contact attachment writers were consolidated into one shared
+  `AttachmentWriter` (behavior-preserving), which the calendar/task writers reuse. A pure, root-aware
+  `CalendarAttachmentResolver` classifies each iCal `ATTACH` into embedded-bytes / in-profile-file /
+  link-only, enforcing the security boundaries (no network fetch, no path traversal, symlinks refused,
+  oversized attachments degraded to a link). Link-only attachments and preserved `RELATED-TO` relations
+  share one dedup-aware `CalendarBodyAppendix` applied to both the plain and HTML body. `GlobalObjectId`
+  is hex-decoded verbatim from the cached-Exchange source id (never synthesized). Online-meeting handling
+  writes no native props by design — docs confirm classic Outlook renders no Join affordance from them,
+  so the join URL is preserved in the body. Unicode round-trip locks and an opt-in real-corpus smoke pin
+  the behavior.
 
 ## [0.2.3] — 2026-06-28
 

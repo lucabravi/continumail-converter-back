@@ -7,6 +7,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading;
+using Mail2Pst.Core.Calendar;
 using Mail2Pst.Core.Config;
 using Mail2Pst.Core.Contacts;
 using Mail2Pst.Core.Diagnostics;
@@ -34,7 +35,7 @@ public class ConversionRunner
         _writer = new PstWriter(checkIntervalMessages, progressIntervalMessages);
     }
 
-    public ConversionReport Run(ConversionConfig config, string outputDirectory, Action<ConversionProgressEvent>? onProgress = null, CancellationToken cancellationToken = default, DurableMemoryObserver? memoryObserver = null, int precomputedTotalMessages = -1)
+    public ConversionReport Run(ConversionConfig config, string outputDirectory, Action<ConversionProgressEvent>? onProgress = null, CancellationToken cancellationToken = default, DurableMemoryObserver? memoryObserver = null, int precomputedTotalMessages = -1, bool skipTasks = false, bool skipAppointments = false)
     {
         // Validate the config up front (output names, duplicates, sizes, sources)
         // so problems fail loudly before any output file is created.
@@ -90,6 +91,11 @@ public class ConversionRunner
             onProgress(new ScanEvent(total));
         }
 
+        // Track whether the "X disabled by --no-X" warning has already been emitted
+        // so each is emitted exactly once even when multiple output groups carry those mappings.
+        bool noTasksWarned = false;
+        bool noAppointmentsWarned = false;
+
         try
         {
             foreach (PstOutputPlan plan in plans)
@@ -132,7 +138,163 @@ public class ConversionRunner
                     }
                 }
 
-                List<string> outputFiles = _writer.WritePlan(plan, plannedMessages, planned, contactFolders, outputDirectory, report, total, onProgress, cancellationToken, memoryObserver);
+                // Shared per-plan calendar read cache: reads each SQLite store at most once
+                // regardless of whether it is accessed by the task loop, the appointment loop,
+                // or both. Cross-platform key: normalize path; on Windows fold case.
+                var calendarReadCache = new Dictionary<string, CalendarReadResult>(
+                    OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+
+                CalendarReadResult ReadCalendarStore(string storePath, Action<string> recordStoreWarning)
+                {
+                    string key = Path.GetFullPath(storePath);
+                    if (!calendarReadCache.TryGetValue(key, out var r))
+                    {
+                        r = new SqliteCalendarReader().Read(storePath);
+                        calendarReadCache[key] = r;
+                        // Record store-level warnings once (not per-mapping). For a store backing BOTH a task
+                        // and an appointment mapping, warnings are recorded via the first caller (task loop) —
+                        // the appointment loop skips the cache miss branch entirely. Intentional, not a bug.
+                        foreach (string warn in r.Warnings)
+                            recordStoreWarning(warn);
+                    }
+                    return r;
+                }
+
+                // Assemble tasks for this output group.
+                var plannedTasks = new List<PlannedTask>();
+                var taskFolders = new List<IReadOnlyList<string>>();
+
+                if (skipTasks && plan.TaskMappings.Count > 0 && !noTasksWarned)
+                {
+                    report.RecordTaskWarning("tasks disabled by --no-tasks");
+                    noTasksWarned = true;
+                }
+                else if (!skipTasks && plan.TaskMappings.Count > 0)
+                {
+                    foreach (TaskMapping tm in plan.TaskMappings)
+                    {
+                        taskFolders.Add(tm.TargetFolderPath);
+                        CalendarReadResult read;
+                        try { read = ReadCalendarStore(tm.Source.StorePath, w => report.RecordTaskWarning(w)); }
+                        catch (Exception ex) when (ex is IOException or SqliteException or UnauthorizedAccessException)
+                        {
+                            report.RecordTaskWarning($"Calendar store skipped [{tm.Source.StorePath}]: {ex.Message}");
+                            continue;
+                        }
+
+                        // Filter to the specified calendar (or all calendars when CalId is empty).
+                        IEnumerable<RawCalendarRead> cals = string.IsNullOrEmpty(tm.Source.CalId)
+                            ? read.Calendars
+                            : read.Calendars.Where(c => c.CalId == tm.Source.CalId);
+
+                        var taskAttResolver = new CalendarAttachmentResolver(ResolveCalendarAttachmentRoot(tm.Source, config));
+                        foreach (RawCalendarRead cal in cals)
+                        {
+                            foreach (RawTodoGroup group in cal.TodoGroups)
+                            {
+                                // Per-item containment: a single malformed todo must never abort the whole
+                                // conversion (mail/contacts/other calendars). Mirrors SqliteCalendarReader's
+                                // per-row catch — calendar data is fully untrusted.
+                                try
+                                {
+                                    TaskRecord? mapped = CalendarTaskMapper.Map(group, out IReadOnlyList<string> warns);
+                                    foreach (string w in warns)
+                                        report.RecordTaskWarning(w);
+                                    if (mapped is null)
+                                    {
+                                        // Map returned null; the first warning (if any) describes the reason.
+                                        report.RecordTaskSkipped(
+                                            tm.Source.StorePath,
+                                            warns.Count > 0 ? warns[0] : "unmappable task");
+                                    }
+                                    else
+                                    {
+                                        ApplyCalendarAttachments(mapped, group.Master?.Attachments ?? new List<RawSideText>(), taskAttResolver, report.RecordTaskWarning);
+                                        plannedTasks.Add(new PlannedTask
+                                        {
+                                            Task = mapped,
+                                            TargetFolderPath = tm.TargetFolderPath,
+                                        });
+                                    }
+                                }
+                                catch (Exception ex) when (ex is not OperationCanceledException)
+                                {
+                                    report.RecordTaskSkipped(tm.Source.StorePath,
+                                        $"task '{group.Master?.Id ?? "(unknown)"}' skipped: {ex.Message}");
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Assemble appointments for this output group.
+                var plannedAppointments = new List<PlannedAppointment>();
+                var appointmentFolders = new List<IReadOnlyList<string>>();
+
+                if (skipAppointments && plan.AppointmentMappings.Count > 0 && !noAppointmentsWarned)
+                {
+                    report.RecordAppointmentWarning("appointments disabled by --no-appointments");
+                    noAppointmentsWarned = true;
+                }
+                else if (!skipAppointments && plan.AppointmentMappings.Count > 0)
+                {
+                    foreach (AppointmentMapping am in plan.AppointmentMappings)
+                    {
+                        appointmentFolders.Add(am.TargetFolderPath);
+                        CalendarReadResult read;
+                        try { read = ReadCalendarStore(am.Source.StorePath, w => report.RecordAppointmentWarning(w)); }
+                        catch (Exception ex) when (ex is IOException or SqliteException or UnauthorizedAccessException)
+                        {
+                            report.RecordAppointmentWarning($"Calendar store skipped [{am.Source.StorePath}]: {ex.Message}");
+                            continue;
+                        }
+
+                        // Filter to the specified calendar (or all calendars when CalId is empty).
+                        IEnumerable<RawCalendarRead> cals = string.IsNullOrEmpty(am.Source.CalId)
+                            ? read.Calendars
+                            : read.Calendars.Where(c => c.CalId == am.Source.CalId);
+
+                        var apptAttResolver = new CalendarAttachmentResolver(ResolveCalendarAttachmentRoot(am.Source, config));
+                        foreach (RawCalendarRead cal in cals)
+                        {
+                            foreach (RawEventGroup group in cal.EventGroups)
+                            {
+                                // Per-item containment: a single malformed event must never abort the whole
+                                // conversion (mail/contacts/other calendars). Mirrors SqliteCalendarReader's
+                                // per-row catch — calendar data is fully untrusted.
+                                try
+                                {
+                                    AppointmentRecord? mapped = CalendarEventMapper.Map(group, out IReadOnlyList<string> warns);
+                                    foreach (string w in warns)
+                                        report.RecordAppointmentWarning(w);
+                                    if (mapped is null)
+                                    {
+                                        // Map returned null; the first warning (if any) describes the reason.
+                                        report.RecordAppointmentSkipped(
+                                            am.Source.StorePath,
+                                            warns.Count > 0 ? warns[0] : "unmappable event");
+                                    }
+                                    else
+                                    {
+                                        ApplyCalendarAttachments(mapped, group.Master?.Attachments ?? new List<RawSideText>(), apptAttResolver, report.RecordAppointmentWarning);
+                                        plannedAppointments.Add(new PlannedAppointment
+                                        {
+                                            Appointment = mapped,
+                                            TargetFolderPath = am.TargetFolderPath,
+                                        });
+                                    }
+                                }
+                                catch (Exception ex) when (ex is not OperationCanceledException)
+                                {
+                                    report.RecordAppointmentSkipped(am.Source.StorePath,
+                                        $"event '{group.Master?.Id ?? "(unknown)"}' skipped: {ex.Message}");
+                                }
+                            }
+                        }
+                    }
+                }
+
+                List<string> outputFiles = _writer.WritePlan(plan, plannedMessages, planned, contactFolders, plannedTasks, taskFolders, plannedAppointments, appointmentFolders, outputDirectory, report, total, onProgress, cancellationToken, memoryObserver);
                 report.AddOutputFiles(outputFiles);
             }
 
@@ -142,7 +304,7 @@ public class ConversionRunner
             // it propagates out of Run to the CLI's fatal error path. Runs only here, on the
             // fully-successful path: cancellation throws out of the loop above and never reaches
             // this line, and the writer's own fatal aborts have already propagated.
-            PstOutputVerifier.Verify(report.OutputFiles, report.ConvertedCount + report.ContactsConverted);
+            PstOutputVerifier.Verify(report.OutputFiles, report.TotalWrittenItems);
         }
         catch (OperationCanceledException)
         {
@@ -152,6 +314,38 @@ public class ConversionRunner
         }
 
         return report;
+    }
+
+    // …/<profile>/calendar-data/local.sqlite → <profile>. Explicit ProfilePath wins. Returns null when the
+    // store isn't under the expected calendar-data shape → local-file attachments become link-only (safe).
+    internal static string? ResolveCalendarAttachmentRoot(CalendarSourceConfig source, ConversionConfig config)
+    {
+        if (!string.IsNullOrWhiteSpace(config.ProfilePath)) return config.ProfilePath;
+        string? calDataDir = Path.GetDirectoryName(source.StorePath);
+        if (calDataDir is null ||
+            !string.Equals(Path.GetFileName(calDataDir), "calendar-data", StringComparison.OrdinalIgnoreCase))
+            return null;
+        return Path.GetDirectoryName(calDataDir);
+    }
+
+    // The resolve seam (unit-testable). subject used only for warning locality.
+    internal static void ApplyCalendarAttachments(
+        AppointmentRecord record, IEnumerable<RawSideText> raw,
+        CalendarAttachmentResolver resolver, Action<string> recordWarning)
+    {
+        var (atts, warns) = resolver.ResolveAll(raw, record.Subject);
+        record.Attachments = atts;
+        foreach (string w in warns) recordWarning(w);
+    }
+
+    // Overload for TaskRecord (same body; TaskRecord.Attachments / record.Subject).
+    internal static void ApplyCalendarAttachments(
+        TaskRecord record, IEnumerable<RawSideText> raw,
+        CalendarAttachmentResolver resolver, Action<string> recordWarning)
+    {
+        var (atts, warns) = resolver.ResolveAll(raw, record.Subject);
+        record.Attachments = atts;
+        foreach (string w in warns) recordWarning(w);
     }
 
     private static IEnumerable<PlannedMessage> EnumeratePlannedMessages(

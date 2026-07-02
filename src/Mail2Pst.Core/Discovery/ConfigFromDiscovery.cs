@@ -16,11 +16,20 @@ namespace Mail2Pst.Core.Discovery;
 /// <para>When <paramref name="includeContacts"/> is true (default), discovered address books are
 /// synthesized as <see cref="ContactSourceConfig"/> entries on each output group that has no
 /// explicit template contacts. Explicit template contacts always win per group.</para>
+/// <para>When <paramref name="includeTasks"/> is true (default), discovered calendars with
+/// <see cref="DiscoveredCalendarSource.TaskCount"/> &gt; 0 are synthesized as
+/// <see cref="CalendarSourceConfig"/> entries on each output group that has no explicit
+/// template calendars. Explicit template calendars always win per group.</para>
+/// <para>When <paramref name="includeAppointments"/> is true (default), discovered calendars with
+/// <see cref="DiscoveredCalendarSource.EventCount"/> &gt; 0 are synthesized as
+/// <see cref="CalendarSourceConfig"/> entries carrying appointment fields. One config per calendar
+/// carries both appointments and tasks when both conditions are met. Explicit template calendars
+/// always win per group.</para>
 /// </summary>
 public static class ConfigFromDiscovery
 {
     public static ConversionConfig Build(DiscoveryResult discovery, ConversionConfig? template = null,
-        bool includeContacts = true)
+        bool includeContacts = true, bool includeTasks = true, bool includeAppointments = true)
     {
         ArgumentNullException.ThrowIfNull(discovery);
 
@@ -86,6 +95,33 @@ public static class ConfigFromDiscovery
                         Format = book.Format,
                         TargetFolderPath = new[] { "Contacts", book.DisplayName },
                     });
+            }
+        }
+
+        // Synthesize calendar sources from discovered calendars.
+        // One CalendarSourceConfig per source carries whichever of appointments/tasks it has.
+        // Explicit template calendars win per group — skip synthesis if the group already has calendars.
+        if (includeTasks || includeAppointments)
+        {
+            foreach (OutputGroupConfig output in config.Outputs)
+            {
+                if (output.Calendars.Count > 0) continue; // explicit template calendars win for this group
+                foreach (DiscoveredCalendarSource src in discovery.Calendars)
+                {
+                    bool wantAppts = includeAppointments && src.EventCount > 0;
+                    bool wantTasks = includeTasks && src.TaskCount > 0;
+                    if (!wantAppts && !wantTasks) continue;
+
+                    output.Calendars.Add(new CalendarSourceConfig
+                    {
+                        StorePath = src.StorePath,
+                        CalId = src.CalId,
+                        IncludeAppointments = wantAppts,
+                        AppointmentFolderPath = wantAppts ? src.DefaultCalendarFolderPath.ToArray() : null,
+                        IncludeTasks = wantTasks,
+                        TaskFolderPath = wantTasks ? src.DefaultTaskFolderPath.ToArray() : null,
+                    });
+                }
             }
         }
 

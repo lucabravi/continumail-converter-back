@@ -185,4 +185,97 @@ authoritative description of the local PSTFileFormat modifications.
   the earlier ContinuMail batch; verified against MS-OXPROPS specification and a real Outlook
   contact PST with embedded photo).
 
+- Round-tripped recipient track status (`PidTagRecipientTrackStatus`) via `MessageRecipient.ResponseStatus` (written in `AddRecipient`, read in `GetRecipient`), and registered `PidLidResponseStatus` (0x8218, PSETID_Appointment) for meeting recipients (ContinuMail, 2026).
+
+- `Messaging/Messages/RecurringAppointment.cs` (`GetRecurrencePattern`, end-by-date branch): compute
+  `OccurrenceCount` for an end-by-date (UNTIL) recurring series via
+  `CalendarHelper.CalculateNumberOfOccurences(...)` instead of the upstream hard-coded sentinel `10`
+  (ContinuMail addition 2026: appointment recurrence write). Real classic-Outlook output writes the
+  actual occurrence count even for end-by-date series, so the previous fixed `10` produced a
+  `PidLidAppointmentRecur` blob that did not match Outlook byte-for-byte (e.g. the "2nd Tuesday until
+  31 Jan 2027" ground-truth blob has `OccurrenceCount = 7`, not `10`). The computed count is always
+  `>= 1`, preserving the upstream invariant that it must not be `0` (else Outlook 2003's recurrence
+  window fails to load). Proven against the Outlook-authored ground-truth dump by
+  `tests/Mail2Pst.Core.Tests/Vendor/RecurringAppointmentBlobTests.Monthly_2ndTuesday_full_blob_matches_dump`
+  (full-blob byte equality). The end-after-N and never-end branches are unchanged.
+
+- `Messaging/Messages/RecurringAppointment.cs` (`OriginalTimeZone` getter + `SetOriginalTimeZone` +
+  new `m_originalTimeZone` field): cache the zone supplied to `SetOriginalTimeZone` and return it
+  directly from the `OriginalTimeZone` getter on the write path, instead of re-deriving it from the
+  serialized `PidLidTimeZoneStruct` blob via `RegistryTimeZoneUtils` (ContinuMail addition 2026:
+  cross-platform recurrence write). The getter is read repeatedly while writing (the `StartDTUtc` and
+  `LastInstanceStartDate` setters and `SaveChanges`); the upstream blob-derivation path calls
+  `Microsoft.Win32.Registry`, which throws `PlatformNotSupportedException` on Linux/macOS (and, for a
+  zone whose key name is absent from the registry, silently falls back to the local system zone). The
+  cached field is null when the object is constructed by reading an existing file, so the read path is
+  unchanged. Output PSTs are byte-for-byte unchanged (all `RecurringAppointmentBlobTests` full-blob
+  gates still pass); proven by `RecurringAppointmentBlobTests.SetOriginalTimeZone_is_cached_not_re_derived_from_registry`.
+
+- `Messaging/Messages/RecurringAppointment.cs` (new nullable `OccurrenceCount` field +
+  `GetRecurrencePattern` end-after-N branch): when the caller supplies an explicit occurrence count
+  (`OccurrenceCount > 0`), write it verbatim as the blob's `OccurrenceCount` instead of the date-span
+  heuristic `CalendarHelper.CalculateNumberOfOccurences(...)` (ContinuMail addition 2026: appointment
+  recurrence write, pre-merge review #5). The heuristic overcounts period-skipping COUNT series (e.g.
+  `FREQ=MONTHLY;BYMONTHDAY=31;COUNT=5` spans 7 months → wrote 8; Feb-29 yearly `COUNT=3` → wrote 9),
+  producing phantom occurrences in Outlook. The field is null for callers that do not set it (the
+  vendor blob tests set `EndAfterNumberOfOccurences` directly), so those keep the heuristic and stay
+  byte-identical. The end-by-date (UNTIL) branch is unchanged (it still uses the heuristic, which
+  matches Outlook there). Proven by `AppointmentWriterRecurrenceTests.Count_series_month_overflow_writes_exact_occurrence_count`.
+
+- `Messaging/Messages/RecurrencePatternStructure/AppointmentRecurrencePatternStructure.cs` (`GetBytes`):
+  emit the `ExceptionInfo` and `ExtendedException` arrays sorted ascending by `NewStartDT` (a sorted copy;
+  caller state untouched) instead of in insertion order (ContinuMail addition 2026: appointment recurrence
+  write, pre-merge review #10). `WriteRecurrencePattern` already writes `ModifiedInstanceDates` sorted, and
+  MS-OXOCAL 2.2.1.44 requires the exception arrays to be in the same ascending order and to correspond
+  positionally. Overrides can arrive in arbitrary (SQLite row) order, which desynced the two arrays and
+  risked scanpst `RepairRequired`. Single-exception and already-ordered cases sort to the same bytes, so
+  existing blob gates are unaffected. Proven by
+  `AppointmentWriterRecurrenceTests.Out_of_order_overrides_keep_exception_and_modified_date_arrays_corresponding`.
+
+- `Messaging/Messages/RecurrencePatternStructure/AppointmentRecurrencePatternStructure.cs`: extracted the
+  RecurrencePattern prefix bytes (ReaderVersion … EndDate) of `GetBytes` into a private
+  `WriteRecurrencePattern(MemoryStream)` and added a public `byte[] GetRecurrencePatternBytes()` that emits
+  ONLY that prefix — the bare MS-OXOCAL RecurrencePattern with no AppointmentRecurrencePattern tail
+  (ContinuMail addition 2026: needed because `PidLidTaskRecurrence` (0x8116, PSETID_Task) stores a bare
+  RecurrencePattern). `GetBytes` delegates the prefix to `WriteRecurrencePattern` and stays byte-identical
+  for every appointment path. Supporting: `Messaging/Enums/PropertyLongID.cs` added
+  `PidLidTaskRecurrence = 0x00008116`; `Messaging/NamedProperties/PropertyNames.cs` registered
+  `PidLidTaskFRecurring` + `PidLidTaskRecurrence` under `PSETID_Task`. Byte-gated by
+  `tests/Mail2Pst.Core.Tests/Vendor/RecurringAppointmentBlobTests.cs`
+  (`GetRecurrencePatternBytes_is_the_prefix_of_GetBytes` + `Bare_pattern_matches_task_GT_oracle`).
+
+- Cross-platform PST read path — the timezone reconstruction used when READING a recurring/single appointment
+  back from a store (`OriginalTimeZone` getter -> `TimeZoneStructure.ToTimeZoneInfo` /
+  `TimeZoneDefinitionRecurStructure.ToTimeZoneInfo` / `TimeZoneInfoUtils.GetSystemStaticTimeZone`) called the
+  Windows registry via `RegistryTimeZoneUtils`, which returns `null` from `Registry.LocalMachine.OpenSubKey`
+  on Linux/macOS and then dereferenced it, throwing `NullReferenceException` (ContinuMail addition 2026;
+  surfaced by CI: the calendar tests read appointments back to assert blob bytes and failed on ubuntu/macOS
+  while passing on Windows). Fixes (all null-guards / fallbacks; Windows behaviour is byte-for-byte unchanged
+  because the registry keys are present there):
+  - `Utils/RegistryTimeZoneUtils.Win32.cs`: `GetStaticTimeZoneInformation`, `GetDisplayName`, and
+    `IsDaylightSavingsEnabled` now return gracefully (null / default) when the registry root key is absent.
+  - `Utils/AdjustmentRuleUtils.Win32.cs` (`GetStaticAdjustmentRule`): returns null when the registry info is null.
+  - `Messaging/Messages/TimeZoneStructure/TimeZoneStructure.cs` (`ToTimeZoneInfo`) and
+    `Messaging/Messages/TimeZoneDefinitionStructure/TimeZoneDefinitionRecurStructure.cs` (`ToTimeZoneInfo`):
+    fall back to the zone id when the registry display names are null, so `CreateCustomTimeZone` (which rejects
+    null names) still succeeds — the zone's offset and DST transitions come from the structure bytes, not the
+    registry, so this is display-only.
+  - `Utils/TimeZoneInfoUtils.Win32.cs` (`GetSystemStaticTimeZone`): when the registry info is null, reconstruct
+    from the runtime's own zone database (`TimeZoneInfo.FindSystemTimeZoneById`, cross-platform via ICU),
+    falling back to UTC. The production WRITE path is registry-free already (the zone is cached at
+    `SetOriginalTimeZone`); this makes the READ path (tests / any cross-platform reader use) equally safe.
+  Regression test: `RecurringAppointmentBlobTests.ToTimeZoneInfo_without_registry_display_names_does_not_throw`
+  (runs on Windows too, by using an unknown zone id whose registry key is absent — the same null path as Linux).
+
+- Cross-platform PST write path — `Messaging/Messages/TimeZoneStructure/AdjustmentRuleHelper.cs`
+  (`FromTransitionTime`): some non-Windows (ICU) `TimeZoneInfo` rules express a DST transition as a fixed
+  calendar date over a multi-year span (e.g. "Romance Standard Time"/Europe zones on Linux/macOS), which the
+  one-time `SYSTEMTIME` absolute form cannot hold. Upstream threw
+  `"Cannot create transition time with absolute date that spans multiple years"`, which aborted writing ANY
+  appointment (single or recurring) in such a zone off-Windows (ContinuMail addition 2026; CI-surfaced). It now
+  converts the fixed date to the equivalent relative-yearly rule (Nth weekday of the month) instead of throwing
+  — approximate but valid. Only reached off-Windows (Windows rules are floating, so Windows byte output is
+  unchanged). Regression test:
+  `RecurringAppointmentBlobTests.FromTransitionTime_multi_year_fixed_date_becomes_relative_rule`.
+
 See the project git history (`git log -- vendor/PSTFileFormat`) for the full diffs.

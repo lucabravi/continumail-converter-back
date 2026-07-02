@@ -80,6 +80,61 @@ public static class MappingEngine
                         $"Contact folder '{key}' collides with a mail folder of a different item type in output '{output.Name}'.");
             }
 
+            // Build task mappings.
+            foreach (CalendarSourceConfig cal in output.Calendars ?? new List<CalendarSourceConfig>())
+            {
+                if (!cal.IncludeTasks)
+                    continue;
+                IReadOnlyList<string> target = cal.TaskFolderPath
+                    ?? new[] { "Tasks", cal.CalId };
+                plan.TaskMappings.Add(new TaskMapping
+                {
+                    Source = cal,
+                    TargetFolderPath = target,
+                });
+            }
+
+            // Build appointment mappings.
+            foreach (CalendarSourceConfig cal in output.Calendars ?? new List<CalendarSourceConfig>())
+            {
+                if (!cal.IncludeAppointments)
+                    continue;
+                IReadOnlyList<string> target = cal.AppointmentFolderPath
+                    ?? new[] { "Calendars", cal.CalId };
+                plan.AppointmentMappings.Add(new AppointmentMapping
+                {
+                    Source = cal,
+                    TargetFolderPath = target,
+                });
+            }
+
+            // Plan-stage item-type collision check: task and appointment folder paths must not
+            // equal a mail, contact, task, or appointment folder path of a different item type.
+            // Build one unified key set covering mail + contacts, then check tasks and appointments
+            // against each other and against that set.
+            var mailAndContactKeys = new HashSet<string>(
+                plan.SourceMappings.Select(m => FolderPathKey.Join(m.TargetFolderPath))
+                    .Concat(plan.ContactMappings.Select(m => FolderPathKey.Join(m.TargetFolderPath))),
+                StringComparer.OrdinalIgnoreCase);
+
+            var taskKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (TaskMapping tm in plan.TaskMappings)
+            {
+                string key = FolderPathKey.Join(tm.TargetFolderPath);
+                if (mailAndContactKeys.Contains(key))
+                    throw new ConfigValidationException(
+                        $"Task folder '{key}' collides with a mail or contact folder of a different item type in output '{output.Name}'.");
+                taskKeys.Add(key);
+            }
+
+            foreach (AppointmentMapping am in plan.AppointmentMappings)
+            {
+                string key = FolderPathKey.Join(am.TargetFolderPath);
+                if (mailAndContactKeys.Contains(key) || taskKeys.Contains(key))
+                    throw new ConfigValidationException(
+                        $"Appointment folder '{key}' collides with a mail, contact, or task folder of a different item type in output '{output.Name}'.");
+            }
+
             plans.Add(plan);
         }
 

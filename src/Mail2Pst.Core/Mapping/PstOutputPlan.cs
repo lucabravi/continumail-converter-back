@@ -17,4 +17,6 @@ public class PstOutputPlan
 
     public List<SourceMapping> SourceMappings { get; set; } = new();
     public List<ContactMapping> ContactMappings { get; set; } = new();
+    public List<TaskMapping> TaskMappings { get; set; } = new();
+    public List<AppointmentMapping> AppointmentMappings { get; set; } = new();
 }

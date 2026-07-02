@@ -6,7 +6,9 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using Mail2Pst.Core;
+using Mail2Pst.Core.Calendar;
 using Mail2Pst.Core.Config;
+using Microsoft.Data.Sqlite;
 using Mail2Pst.Core.Contacts;
 using Mail2Pst.Core.Mapping;
 using Mail2Pst.Core.Models;
@@ -143,6 +145,74 @@ public static class RoundTripHarness
                     else
                         throw new InvalidOperationException(
                             $"Contact read failure while building truth for '{cm.Source.Path}': {r.Error}");
+                }
+            }
+
+            // Count tasks analogously.
+            // The writer ALWAYS pre-creates every task folder in Begin() (same as contacts),
+            // so an empty calendar still yields an IPF.Task folder. Mirror that: always
+            // EnsurePrefixes for every TaskMapping, then add one placeholder MailMessage per
+            // task that CalendarTaskMapper.Map would actually write (non-null result only —
+            // so recurring/skipped todos don't inflate the expected count).
+            foreach (TaskMapping tm in plan.TaskMappings)
+            {
+                IReadOnlyList<string> taskPath = tm.TargetFolderPath;
+                // Always pre-create the folder (mirrors runner's Begin() which pre-creates task folders).
+                EnsurePrefixes(taskPath);
+                string taskLeafKey = FolderPathKey.Join(taskPath);
+
+                // Mirror ConversionRunner.ReadStore: an unreadable store warns + continues with 0 tasks.
+                // BuildTruth mirrors that by catching the same exception types and yielding count 0.
+                CalendarReadResult calRead;
+                try { calRead = new SqliteCalendarReader().Read(tm.Source.StorePath); }
+                catch (Exception ex) when (ex is IOException or SqliteException) { continue; }
+
+                IEnumerable<RawCalendarRead> cals = string.IsNullOrEmpty(tm.Source.CalId)
+                    ? calRead.Calendars
+                    : calRead.Calendars.Where(c => c.CalId == tm.Source.CalId);
+
+                foreach (RawCalendarRead cal in cals)
+                {
+                    foreach (RawTodoGroup group in cal.TodoGroups)
+                    {
+                        TaskRecord? mapped = CalendarTaskMapper.Map(group, out _);
+                        if (mapped is not null)
+                            truth[taskLeafKey].Add(new MailMessage());
+                    }
+                }
+            }
+
+            // Count appointments analogously.
+            // The writer ALWAYS pre-creates every appointment folder in Begin() (same as contacts/tasks),
+            // so an empty calendar still yields an IPM.Appointment folder. Mirror that: always
+            // EnsurePrefixes for every AppointmentMapping, then add one placeholder MailMessage per
+            // appointment that CalendarEventMapper.Map would actually write (non-null result only —
+            // so recurring/skipped events don't inflate the expected count).
+            foreach (AppointmentMapping am in plan.AppointmentMappings)
+            {
+                IReadOnlyList<string> apptPath = am.TargetFolderPath;
+                // Always pre-create the folder (mirrors runner's Begin() which pre-creates appointment folders).
+                EnsurePrefixes(apptPath);
+                string apptLeafKey = FolderPathKey.Join(apptPath);
+
+                // Mirror ConversionRunner.ReadStore: an unreadable store warns + continues with 0 appointments.
+                // BuildTruth mirrors that by catching the same exception types and yielding count 0.
+                CalendarReadResult calRead;
+                try { calRead = new SqliteCalendarReader().Read(am.Source.StorePath); }
+                catch (Exception ex) when (ex is IOException or SqliteException) { continue; }
+
+                IEnumerable<RawCalendarRead> apptCals = string.IsNullOrEmpty(am.Source.CalId)
+                    ? calRead.Calendars
+                    : calRead.Calendars.Where(c => c.CalId == am.Source.CalId);
+
+                foreach (RawCalendarRead cal in apptCals)
+                {
+                    foreach (RawEventGroup group in cal.EventGroups)
+                    {
+                        AppointmentRecord? mapped = CalendarEventMapper.Map(group, out _);
+                        if (mapped is not null)
+                            truth[apptLeafKey].Add(new MailMessage());
+                    }
                 }
             }
         }
