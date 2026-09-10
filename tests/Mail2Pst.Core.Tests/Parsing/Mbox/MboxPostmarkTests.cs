@@ -27,4 +27,26 @@ public class MboxPostmarkTests
     [Fact]
     public void PlainText_DoesNotMatch()
         => Assert.False(Sniff("Hello, this is not an mbox line"));
+
+    [Fact]
+    public void NumericTimezonePostmark_ParsesDate()
+    {
+        bool parsed = MboxPostmark.TryParseDate(
+            Encoding.ASCII.GetBytes("From sender@host Tue Sep 01 13:10:38 +0000 2026"),
+            out DateTimeOffset date);
+
+        Assert.True(parsed);
+        Assert.Equal(new DateTimeOffset(2026, 9, 1, 13, 10, 38, TimeSpan.Zero), date);
+    }
+
+    [Fact]
+    public void PostmarkWithoutTimezone_ParsesDateAsUtcWallClock()
+    {
+        bool parsed = MboxPostmark.TryParseDate(
+            Encoding.ASCII.GetBytes("From sender@host Thu Jan  1 00:00:00 2020"),
+            out DateTimeOffset date);
+
+        Assert.True(parsed);
+        Assert.Equal(new DateTimeOffset(2020, 1, 1, 0, 0, 0, TimeSpan.Zero), date);
+    }
 }

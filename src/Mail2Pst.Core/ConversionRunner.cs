@@ -404,6 +404,22 @@ public class ConversionRunner
     {
         foreach (SourceMapping mapping in plan.SourceMappings)
         {
+            long gmailSourceMessages = 0;
+            long gmailLabeledMessages = 0;
+            long gmailLabelAssignments = 0;
+            long gmailPstCopiesPlanned = 0;
+            var gmailLabelNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var emittedGmailWarnings = new HashSet<string>(StringComparer.Ordinal);
+
+            void EmitGmailWarning(SourceReference source, string warning)
+            {
+                // Folder/category adjustments are label-level facts and can repeat thousands of
+                // times. Emit each exact cause once per source; the raw label remains in the warning.
+                if (!emittedGmailWarnings.Add(warning)) return;
+                report.RecordWarning(source, warning);
+                onProgress?.Invoke(new WarningEvent(source.SourcePath, source.Identifier, warning));
+            }
+
             // Build optional .msf enrichment for this source (records attempted/degraded + any warning,
             // emitting a live WarningEvent through onProgress on degradation).
             SourceEnrichmentContext? enrichment =
@@ -487,10 +503,34 @@ public class ConversionRunner
                     IReadOnlyList<string> targetPath = JunkRouting.ResolveTargetFolderPath(
                         mapping.TargetFolderPath, message.IsJunk, enrichmentOptions.JunkHandling);
 
+                    bool preserveExplicitRoute = !string.Equals(
+                        FolderPathKey.Join(mapping.TargetFolderPath),
+                        FolderPathKey.Join(targetPath),
+                        StringComparison.Ordinal);
+                    GmailLabelMappingResult gmailMapping = GmailLabelMapper.Map(
+                        message,
+                        preserveExplicitRoute ? targetPath : mapping.TargetFolderPath,
+                        mapping.GmailLabelMode,
+                        mapping.GmailPrimaryLabelPriority,
+                        preserveBaseFolder: preserveExplicitRoute);
+                    foreach (string warning in gmailMapping.Warnings)
+                        EmitGmailWarning(result.Source, warning);
+
+                    gmailSourceMessages++;
+                    gmailPstCopiesPlanned += gmailMapping.TargetFolderPaths.Count;
+                    if (message.GmailLabels.Count > 0)
+                    {
+                        gmailLabeledMessages++;
+                        gmailLabelAssignments += message.GmailLabels.Count;
+                        foreach (string label in message.GmailLabels)
+                            gmailLabelNames.Add(label);
+                    }
+
                     yield return new PlannedMessage
                     {
                         Message = message,
-                        TargetFolderPath = targetPath,
+                        TargetFolderPath = gmailMapping.TargetFolderPaths[0],
+                        AdditionalTargetFolderPaths = gmailMapping.TargetFolderPaths.Skip(1).ToArray(),
                     };
                 }
             }
@@ -499,6 +539,27 @@ public class ConversionRunner
                 if (enrichment is not null)
                 {
                     report.RecordEnrichmentCounts(enrichment.Result);
+                }
+
+                report.RecordGmailLabelSource(
+                    gmailSourceMessages,
+                    gmailLabeledMessages,
+                    gmailLabelAssignments,
+                    gmailPstCopiesPlanned,
+                    gmailLabelNames);
+
+                if (mapping.GmailLabelMode == GmailLabelMode.ExactFolders
+                    && gmailLabeledMessages > 0)
+                {
+                    double multiplier = gmailSourceMessages == 0
+                        ? 0
+                        : (double)gmailPstCopiesPlanned / gmailSourceMessages;
+                    EmitGmailWarning(
+                        new SourceReference { SourcePath = mapping.Source.Path, Identifier = "(gmail-labels)" },
+                        "[integrity:gmail-label-exact-mode-copy-count] ExactFolders planned " +
+                        $"{gmailPstCopiesPlanned} physical PST items from {gmailSourceMessages} source messages " +
+                        $"({multiplier:F2} copies per source message). Bodies and attachments are duplicated for " +
+                        "multi-label messages, so actual output disk usage can grow by a similar order of magnitude.");
                 }
             }
         }

@@ -22,6 +22,8 @@ namespace PSTFileFormat
         PidTagSentRepresentingSearchKey = 0x003B, // Binary
         PidTagSentRepresentingEntryId = 0x0041,   // Binary
         PidTagSentRepresentingName = 0x0042,      // String
+        PidTagReplyRecipientEntries = 0x004F,     // Binary, FLATENTRYLIST
+        PidTagReplyRecipientNames = 0x0050,       // String
         PidTagMessageToMe = 0x0057,               // Boolean
         PidTagMessageCcMe = 0x0058,               // Boolean
         PidTagStartDate = 0x0060,                 // DateTime

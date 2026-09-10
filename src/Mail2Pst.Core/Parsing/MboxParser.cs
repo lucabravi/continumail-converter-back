@@ -104,7 +104,7 @@ public class MboxParser : IMailSourceParser
             }
 
             var warnings = new List<string>();
-            MailMessage message = _mapper.Map(mime!, sourceRef, warnings);
+            MailMessage message = _mapper.Map(mime!, sourceRef, warnings, chunk.EnvelopeDate);
             yield return ParseResult.Ok(message, warnings.Count > 0 ? warnings : null);
         }
     }
@@ -174,7 +174,7 @@ public class MboxParser : IMailSourceParser
             }
 
             var warnings = new List<string>();
-            MailMessage message = _mapper.Map(mime!, sourceRef, warnings);
+            MailMessage message = _mapper.Map(mime!, sourceRef, warnings, chunk.EnvelopeDate);
             long estimatedBytes = PstWriter.EstimateMessageSize(message);
             DateTimeOffset? date = message.Date;
 
@@ -267,6 +267,7 @@ public class MboxParser : IMailSourceParser
         bool currentHasContent = false;
         long consumed = 0;       // logical byte offset of line starts (drives boundary offsets)
         long currentStart = 0;   // byte offset of the current message's From_ boundary line
+        DateTimeOffset? currentEnvelopeDate = null;
         long messageBytes = 0;   // content bytes accumulated for the current message (for the cap)
         bool currentOversized = false;
         bool skipToNewline = false;   // draining the tail of a single over-cap line
@@ -338,6 +339,12 @@ public class MboxParser : IMailSourceParser
                 int lineLen = (int)line.Length;
                 bool isBoundary = IsMessageBoundary(line.GetBuffer().AsSpan(0, lineLen), previousLineWasBlank);
                 bool isBlank    = IsBlankLine(line.GetBuffer().AsSpan(0, lineLen));
+                DateTimeOffset? boundaryEnvelopeDate = null;
+                if (materialize && isBoundary
+                    && MboxPostmark.TryParseDate(line.GetBuffer().AsSpan(0, lineLen), out DateTimeOffset parsedEnvelopeDate))
+                {
+                    boundaryEnvelopeDate = parsedEnvelopeDate;
+                }
 
                 if (!isBoundary)
                 {
@@ -360,8 +367,8 @@ public class MboxParser : IMailSourceParser
                         onBytesRead?.Invoke(rawStream.Position);
                         onMessageStart?.Invoke(currentStart);
                         yield return currentOversized
-                            ? MessageChunk.Oversized(messageBytes)
-                            : MessageChunk.Ok(materialize ? current : null);
+                            ? MessageChunk.Oversized(messageBytes, currentEnvelopeDate)
+                            : MessageChunk.Ok(materialize ? current : null, currentEnvelopeDate);
                         current = materialize ? new SpillableMessageBuffer(rawSpillThreshold) : null;
                         currentHasContent = false;
                         messageBytes = 0;
@@ -370,6 +377,7 @@ public class MboxParser : IMailSourceParser
                     if (startAbsolute + lineStart >= endOffset)
                         yield break;
                     currentStart = lineStart;
+                    currentEnvelopeDate = boundaryEnvelopeDate;
                 }
                 else
                 {
@@ -400,8 +408,8 @@ public class MboxParser : IMailSourceParser
             onBytesRead?.Invoke(rawStream.Position);
             onMessageStart?.Invoke(currentStart);
             yield return currentOversized
-                ? MessageChunk.Oversized(messageBytes)
-                : MessageChunk.Ok(materialize ? current : null);
+                ? MessageChunk.Oversized(messageBytes, currentEnvelopeDate)
+                : MessageChunk.Ok(materialize ? current : null, currentEnvelopeDate);
         }
     }
 

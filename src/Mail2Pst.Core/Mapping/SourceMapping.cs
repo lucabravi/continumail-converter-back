@@ -12,4 +12,6 @@ public class SourceMapping
 {
     public SourceConfig Source { get; set; } = new();
     public IReadOnlyList<string> TargetFolderPath { get; set; } = Array.Empty<string>();
+    public GmailLabelMode GmailLabelMode { get; set; } = GmailLabelMode.Compact;
+    public IReadOnlyList<string> GmailPrimaryLabelPriority { get; set; } = Array.Empty<string>();
 }

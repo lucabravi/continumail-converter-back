@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
 using Mail2Pst.Core.Mapping;
@@ -115,6 +116,26 @@ public class PstWriterMetadataTests
             // No crash, and no "SMTP" address type claimed for a non-existent address.
             Assert.True(string.IsNullOrEmpty(note.PC.GetStringProperty(PropertyID.PidTagSenderEmailAddress)));
             Assert.True(string.IsNullOrEmpty(note.PC.GetStringProperty(PropertyID.PidTagSenderAddressType)));
+        }
+        finally { pst.CloseFile(); Directory.Delete(tempDir, true); }
+    }
+
+    [Fact]
+    public void Write_FromWithEmptyDisplayName_FallsBackToEmailForSenderName()
+    {
+        var message = MinimalMessage();
+        // A valid bare address such as `From: <sender@example.com>` has no display name.
+        message.From = new MailAddress { Name = string.Empty, Email = "reception@example.invalid" };
+
+        var (note, pst, tempDir) = WriteAndReadNote(message);
+        try
+        {
+            Assert.Equal("reception@example.invalid",
+                note.PC.GetStringProperty(PropertyID.PidTagSenderName));
+            Assert.Equal("reception@example.invalid",
+                note.PC.GetStringProperty(PropertyID.PidTagSentRepresentingName));
+            Assert.Equal("reception@example.invalid",
+                note.PC.GetStringProperty(PropertyID.PidTagSenderEmailAddress));
         }
         finally { pst.CloseFile(); Directory.Delete(tempDir, true); }
     }
@@ -461,6 +482,124 @@ public class PstWriterMetadataTests
                 if (!string.IsNullOrEmpty(cid)) Assert.True(hidden);   // inline -> hidden
                 else Assert.False(hidden);                              // real -> visible
             }
+        }
+        finally { pst.CloseFile(); Directory.Delete(tempDir, true); }
+    }
+
+    [Fact]
+    public void Write_SenderAndFrom_KeepActualAndRepresentedIdentitiesSeparate()
+    {
+        var message = MinimalMessage();
+        message.From = new MailAddress { Name = "Represented author", Email = "from@example.com" };
+        message.Sender = new MailAddress { Name = "Actual sender", Email = "sender@example.com" };
+
+        var (note, pst, tempDir) = WriteAndReadNote(message);
+        try
+        {
+            Assert.Equal("Actual sender", note.PC.GetStringProperty(PropertyID.PidTagSenderName));
+            Assert.Equal("sender@example.com", note.PC.GetStringProperty(PropertyID.PidTagSenderEmailAddress));
+            Assert.Equal("Represented author", note.PC.GetStringProperty(PropertyID.PidTagSentRepresentingName));
+            Assert.Equal("from@example.com", note.PC.GetStringProperty(PropertyID.PidTagSentRepresentingEmailAddress));
+        }
+        finally { pst.CloseFile(); Directory.Delete(tempDir, true); }
+    }
+
+    [Fact]
+    public void Write_MultipleReplyToAddresses_WritesAlignedFlatEntryListAndNames()
+    {
+        var message = MinimalMessage();
+        message.ReplyTo = new List<MailAddress>
+        {
+            new() { Name = "Reply one", Email = "reply-one@example.com" },
+            new() { Name = "Reply two", Email = "reply-two@example.com" },
+        };
+
+        var (note, pst, tempDir) = WriteAndReadNote(message);
+        try
+        {
+            Assert.Equal("Reply one; Reply two",
+                note.PC.GetStringProperty(PropertyID.PidTagReplyRecipientNames));
+
+            byte[] flatEntryList = note.PC.GetBytesProperty(PropertyID.PidTagReplyRecipientEntries)!;
+            uint count = BinaryPrimitives.ReadUInt32LittleEndian(flatEntryList.AsSpan(0, 4));
+            uint size = BinaryPrimitives.ReadUInt32LittleEndian(flatEntryList.AsSpan(4, 4));
+            Assert.Equal(2U, count);
+            Assert.Equal((uint)(flatEntryList.Length - 8), size);
+
+            int offset = 8;
+            string[] expectedNames = { "Reply one", "Reply two" };
+            string[] expectedEmails = { "reply-one@example.com", "reply-two@example.com" };
+            for (int i = 0; i < (int)count; i++)
+            {
+                uint entryLength = BinaryPrimitives.ReadUInt32LittleEndian(flatEntryList.AsSpan(offset, 4));
+                Assert.True(entryLength > 0);
+                byte[] entryId = new byte[entryLength];
+                Buffer.BlockCopy(flatEntryList, offset + 4, entryId, 0, (int)entryLength);
+                var entry = new RecipientEntryID(entryId);
+                Assert.Equal(expectedNames[i], entry.DisplayName);
+                Assert.Equal(expectedEmails[i], entry.EmailAddress);
+                offset += (int)((entryLength + 4U + 3U) & ~3U);
+            }
+
+            Assert.Equal(flatEntryList.Length, offset);
+        }
+        finally { pst.CloseFile(); Directory.Delete(tempDir, true); }
+    }
+
+    [Fact]
+    public void Write_MultipleToCcBccAddresses_WritesEveryRecipientWithItsType()
+    {
+        var message = MinimalMessage();
+        message.To = new List<MailAddress>
+        {
+            new() { Name = "To one", Email = "to-one@example.com" },
+            new() { Name = "To two", Email = "to-two@example.com" },
+        };
+        message.Cc = new List<MailAddress>
+        {
+            new() { Name = "Cc one", Email = "cc-one@example.com" },
+            new() { Name = "Cc two", Email = "cc-two@example.com" },
+        };
+        message.Bcc = new List<MailAddress>
+        {
+            new() { Name = "Bcc one", Email = "bcc-one@example.com" },
+            new() { Name = "Bcc two", Email = "bcc-two@example.com" },
+        };
+
+        var (note, pst, tempDir) = WriteAndReadNote(message);
+        try
+        {
+            Assert.Equal(6, note.RecipientCount);
+            Dictionary<string, int> types = RecipientTypesByEmail(note);
+            Assert.Equal((int)RecipientType.To, types["to-one@example.com"]);
+            Assert.Equal((int)RecipientType.To, types["to-two@example.com"]);
+            Assert.Equal((int)RecipientType.Cc, types["cc-one@example.com"]);
+            Assert.Equal((int)RecipientType.Cc, types["cc-two@example.com"]);
+            Assert.Equal((int)RecipientType.Bcc, types["bcc-one@example.com"]);
+            Assert.Equal((int)RecipientType.Bcc, types["bcc-two@example.com"]);
+            Assert.Equal("To one; To two", note.PC.GetStringProperty(PropertyID.PidTagDisplayTo));
+            Assert.Equal("Cc one; Cc two", note.PC.GetStringProperty(PropertyID.PidTagDisplayCc));
+            Assert.Equal("Bcc one; Bcc two", note.PC.GetStringProperty(PropertyID.PidTagDisplayBcc));
+        }
+        finally { pst.CloseFile(); Directory.Delete(tempDir, true); }
+    }
+
+    [Fact]
+    public void Write_BareRecipientAddress_FallsBackToEmailForRecipientDisplayName()
+    {
+        var message = MinimalMessage();
+        message.To = new List<MailAddress>
+        {
+            new() { Name = string.Empty, Email = "bare-recipient@example.com" },
+        };
+
+        var (note, pst, tempDir) = WriteAndReadNote(message);
+        try
+        {
+            Assert.Equal("bare-recipient@example.com",
+                note.RecipientsTable.GetStringProperty(0, PropertyID.PidTagDisplayName));
+            Assert.Equal("bare-recipient@example.com",
+                note.PC.GetStringProperty(PropertyID.PidTagDisplayTo));
         }
         finally { pst.CloseFile(); Directory.Delete(tempDir, true); }
     }

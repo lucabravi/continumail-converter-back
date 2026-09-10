@@ -44,6 +44,18 @@ public static class ConfigValidator
                 throw new ConfigValidationException(
                     $"Output '{output.Name}' has maxSizeMB={output.MaxSizeMB}; it must not exceed {MaxSizeMBCap} (50 GB).");
 
+            var gmailPrimaryLabels = output.GmailPrimaryLabelPriority ?? new List<string>();
+            var seenGmailPrimaryLabels = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string label in gmailPrimaryLabels)
+            {
+                if (string.IsNullOrWhiteSpace(label))
+                    throw new ConfigValidationException(
+                        $"Output '{output.Name}' has an empty Gmail primary-label priority entry.");
+                if (!seenGmailPrimaryLabels.Add(label))
+                    throw new ConfigValidationException(
+                        $"Output '{output.Name}' repeats Gmail primary-label priority '{label}'.");
+            }
+
             bool hasMail = output.Sources is { Count: > 0 };
             bool hasContacts = output.Contacts is { Count: > 0 };
             bool hasTasks = output.Calendars is { Count: > 0 } && output.Calendars.Any(c => c.IncludeTasks);

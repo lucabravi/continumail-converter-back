@@ -157,6 +157,8 @@ internal static class ConvertCommand
                 report = reportJsonPath,
                 elapsedMs = stopwatch.ElapsedMilliseconds,
                 enrichment = report.EnrichmentSummary,
+                gmailLabels = report.GmailLabels,
+                gmailLabelNames = report.GmailLabelNames,
                 colourPlan = colourPlan,
                 // additive contact summary fields (non-breaking; schemaVersion stays 1):
                 contactsConverted = report.ContactsConverted,

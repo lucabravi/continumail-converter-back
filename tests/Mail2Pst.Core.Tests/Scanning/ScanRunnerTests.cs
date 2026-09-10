@@ -62,7 +62,7 @@ public class ScanRunnerTests
     }
 
     [Fact]
-    public void Scan_SourceWithNoDatedMessages_LeavesDateRangeNull()
+    public void Scan_SourceWithoutDateHeader_UsesEnvelopeDate()
     {
         var runner = new ScanRunner();
         ScanReport report = runner.Scan(
@@ -70,8 +70,9 @@ public class ScanRunnerTests
 
         SourceScanResult noDates = report.Sources.Single(s => s.Id == "mbox-no-dates");
         Assert.Equal(1, noDates.Messages);
-        Assert.Null(noDates.DateFrom);
-        Assert.Null(noDates.DateTo);
+        Assert.Equal(new DateTimeOffset(2020, 1, 1, 0, 0, 0, TimeSpan.Zero), noDates.DateFrom);
+        Assert.Equal(noDates.DateFrom, noDates.DateTo);
+        Assert.Equal(0, noDates.Warnings);
 
         // The dated source in the same run is unaffected.
         SourceScanResult dated = report.Sources.Single(s => s.Id == "sample");

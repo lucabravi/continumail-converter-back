@@ -141,6 +141,8 @@ A config describes one or more output groups (each becomes a PST file group):
       "name": "Personal",
       "maxSizeMB": 45000,
       "folderMapping": "mirror",
+      "gmailLabelMode": "Compact",
+      "gmailPrimaryLabelPriority": ["INBOX"],
       "includeEmptyFolders": true,
       "sources": [
         { "path": "Takeout/Mail/Inbox.mbox", "type": "mbox" }
@@ -153,9 +155,11 @@ A config describes one or more output groups (each becomes a PST file group):
 - `folderMapping`: `mirror` (one PST folder per source file, named after it) or `flatten` (everything into one folder unless a source sets `targetFolder`).
 - `maxSizeMB`: split into `Name-1.pst`, `Name-2.pst`, … when exceeded; a single un-split output is just `Name.pst`.
 - `includeEmptyFolders`: keep empty source folders as empty PST folders.
+- `gmailLabelMode`: controls Google Takeout `X-Gmail-Labels`. `Compact` (the default) writes one PST item, preserves every label as an Outlook category, and uses one label as its physical folder. `ExactFolders` writes one copy per label and can use substantially more disk space; `Off` retains the legacy folder mapping without label categories.
+- `gmailPrimaryLabelPriority`: optional ordered, case-insensitive list used by `Compact` to choose the physical folder. If none matches, a nested label is preferred, then the first source label. `/` in a label creates nested PST folders.
 - `targetFolderPath` (per source): an array — e.g. `["Inbox", "Archive", "2024"]` — placing that source's mail into a **nested** PST folder; the engine creates the whole path on demand. `targetFolder` (string) is single-segment shorthand for the same thing. Set one or the other, not both. `discover` fills these in for you from a Thunderbird `.sbd` tree.
 
-**`scan`** prints a single pretty-printed JSON object with run-wide `totals` and a per-source breakdown. `bytes` is the estimated PST content size; `sourceBytes` is the raw mbox size; `dateFrom`/`dateTo` are `null` when a source has no dated messages.
+**`scan`** prints a single pretty-printed JSON object with run-wide `totals` and a per-source breakdown. `bytes` is the estimated PST content size; `sourceBytes` is the raw mbox size; `dateFrom`/`dateTo` are `null` only when a source has no usable message date or fallback timestamp.
 
 ```json
 {

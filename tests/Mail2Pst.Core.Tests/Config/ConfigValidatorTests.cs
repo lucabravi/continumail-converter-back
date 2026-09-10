@@ -32,6 +32,26 @@ public class ConfigValidatorTests
         ConfigValidator.Validate(ValidConfig());
     }
 
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void Validate_EmptyGmailPrimaryLabelPriority_Throws(string label)
+    {
+        var config = ValidConfig();
+        config.Outputs[0].GmailPrimaryLabelPriority.Add(label);
+
+        Assert.Throws<ConfigValidationException>(() => ConfigValidator.Validate(config));
+    }
+
+    [Fact]
+    public void Validate_DuplicateGmailPrimaryLabelPriorityCaseInsensitive_Throws()
+    {
+        var config = ValidConfig();
+        config.Outputs[0].GmailPrimaryLabelPriority.AddRange(new[] { "INBOX", "inbox" });
+
+        Assert.Throws<ConfigValidationException>(() => ConfigValidator.Validate(config));
+    }
+
     [Fact]
     public void Validate_NoOutputs_Throws()
     {

@@ -3,6 +3,7 @@
 
 #nullable enable
 using System;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -259,57 +260,67 @@ public class PstWriter
         foreach (PlannedMessage planned in queue.GetConsumingEnumerable())
         {
             currentSource = planned.Message.Source.SourcePath;
-            currentFolder = FolderPathDisplay.Join(planned.TargetFolderPath);
-
             long messageSize = 0;
-            bool written = false;
             try
             {
-                // Cancellation BEFORE the predictive split so a cancelled run never
-                // creates an extra part. Inside the try so finally always disposes this
-                // dequeued message's attachments even if cancel fires before the write.
+                // Cancellation and size estimation occur before the first physical copy, but inside
+                // the outer try so every attachment is disposed even when either operation fails.
                 cancellationToken.ThrowIfCancellationRequested();
-
                 messageSize = EstimateMessageSize(planned.Message);
 
-                if (partManager.ShouldSplitBefore(messageSize))
-                    partManager.FlushAndSplit();
+                IEnumerable<IReadOnlyList<string>> destinations =
+                    new[] { planned.TargetFolderPath }.Concat(planned.AdditionalTargetFolderPaths);
+                foreach (IReadOnlyList<string> destination in destinations)
+                {
+                    currentFolder = FolderPathDisplay.Join(destination);
+                    bool written = false;
+                    try
+                    {
+                        // Check between exact-mode copies as well: cancellation must not create another
+                        // split part or write another full body/attachment copy after it was requested.
+                        cancellationToken.ThrowIfCancellationRequested();
 
-                partManager.Write(planned.TargetFolderPath, planned.Message);
-                report.RecordConverted();
-                written = true;
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch (Exception ex) when (IsRecoverableWriteError(ex))
-            {
-                report.RecordSkipped(planned.Message.Source, ex.Message);
+                        if (partManager.ShouldSplitBefore(messageSize))
+                            partManager.FlushAndSplit();
+
+                        partManager.Write(destination, planned.Message);
+                        report.RecordConverted();
+                        written = true;
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex) when (IsRecoverableWriteError(ex))
+                    {
+                        report.RecordSkipped(planned.Message.Source,
+                            $"PST folder '{currentFolder}': {ex.Message}");
+                    }
+
+                    if (!written) continue;
+
+                    estimatedOutputBytes += messageSize;
+                    partManager.OnWritten(messageSize);
+                    messagesSinceProgress++;
+                    if (messagesSinceProgress >= _progressIntervalMessages)
+                    {
+                        throttler.Emit(report, currentSource, currentFolder, estimatedOutputBytes);
+                        messagesSinceProgress = 0;
+                    }
+
+                    if (partManager.CheckpointDue)
+                    {
+                        partManager.Flush();
+                        memoryObserver?.Observe(partManager.SnapshotDurableMemory(report.ConvertedCount));
+                        throttler.Emit(report, currentSource, currentFolder, estimatedOutputBytes);
+                        partManager.TrySplitOrResumeAfterFlush();
+                    }
+                }
             }
             finally
             {
                 foreach (MailAttachment attachment in planned.Message.Attachments)
                     attachment.Content.Dispose();
-            }
-
-            if (!written) continue;
-
-            estimatedOutputBytes += messageSize;
-            partManager.OnWritten(messageSize);
-            messagesSinceProgress++;
-            if (messagesSinceProgress >= _progressIntervalMessages)
-            {
-                throttler.Emit(report, currentSource, currentFolder, estimatedOutputBytes);
-                messagesSinceProgress = 0;
-            }
-
-            if (partManager.CheckpointDue)
-            {
-                partManager.Flush();
-                memoryObserver?.Observe(partManager.SnapshotDurableMemory(report.ConvertedCount));
-                throttler.Emit(report, currentSource, currentFolder, estimatedOutputBytes);
-                partManager.TrySplitOrResumeAfterFlush();   // both branches leave the part write-ready
             }
         }
 
@@ -519,8 +530,10 @@ public class PstWriter
 
     private static readonly string[] ThreadingPrefixes = { "Re:", "Fwd:", "FW:", "AW:", "SV:", "TR:" };
 
-    // 255 chars is the MAPI subject cap, and the vendored Subject setter prepends the 2-char
-    // MS-PST subject-prefix marker — so the value itself may carry at most 253 chars.
+    // The vendored Subject setter prepends a 2-char MS-PST subject-prefix marker. The converter
+    // therefore keeps a 253-character source-value compatibility limit (255 characters in the
+    // writer's encoded subject envelope). This is a writer/PST safety choice, not a claim that
+    // every Outlook or MAPI provider applies the same visible limit.
     private const int MaxSubjectLength = 253;
 
     /// <summary>
@@ -528,9 +541,8 @@ public class PstWriter
     ///  - strips C0 control characters (0x00–0x1F) and DEL — a leading 0x01 collides with the
     ///    MS-PST subject-prefix encoding, so raw control bytes from a mangled source header make
     ///    scanpst reject the folder's contents-table row ("row doesn't match sub-object");
-    ///  - truncates to the 255-char MAPI cap (incl. the 2-char prefix) — Outlook does the same,
-    ///    and an overlong subject spills the contents-table row cell past the heap allocation
-    ///    limit into a subnode, which scanpst also rejects as a row mismatch.
+    ///  - truncates to the writer's 253-character source-value compatibility limit — keeping the
+    ///    encoded subject envelope within the observed PST/scanpst-safe shape for this writer.
     /// </summary>
     private static string SanitizeSubject(string? subject)
     {
@@ -667,6 +679,14 @@ public class PstWriter
         foreach (MailAttachment attachment in message.Attachments)
             size += attachment.Content.Length + PerAttachmentOverheadBytes;
 
+        if (message.ReplyTo.Count > 0)
+        {
+            // Reply-To uses one display-name string plus one one-off EntryID per usable
+            // mailbox. The fixed overhead is deliberately conservative; the write-plan
+            // checkpoint remains the authoritative size backstop.
+            size += 1024 + 2L * message.ReplyTo.Sum(address => address.Email?.Length ?? 0);
+        }
+
         return size + PerMessageOverheadBytes;
     }
 
@@ -695,6 +715,88 @@ public class PstWriter
 
     internal static bool AttachmentTooLarge(long contentLength) => contentLength > MaxAttachmentBytes;
 
+    private static string GetDisplayName(MailAddress address)
+    {
+        if (!string.IsNullOrWhiteSpace(address.Name))
+            return address.Name!;
+
+        return string.IsNullOrWhiteSpace(address.Email) ? string.Empty : address.Email;
+    }
+
+    private static void SetSenderProperties(Note note, MailAddress address, bool sentRepresenting)
+    {
+        // A malformed/empty address is still allowed to retain its display name, but we
+        // never claim an SMTP address type for an empty mailbox address.
+        string email = address.Email;
+        bool hasEmail = !string.IsNullOrWhiteSpace(email);
+        string displayName = GetDisplayName(address);
+
+        if (sentRepresenting)
+        {
+            note.SentRepresentingName = displayName;
+            if (hasEmail)
+            {
+                note.SentRepresentingAddressType = "SMTP";
+                note.SentRepresentingEmailAddress = email;
+            }
+        }
+        else
+        {
+            note.SenderName = displayName;
+            if (hasEmail)
+            {
+                note.SenderAddressType = "SMTP";
+                note.SenderEmailAddress = email;
+            }
+        }
+    }
+
+    private static void WriteReplyRecipients(Note note, IReadOnlyList<MailAddress> replyTo)
+    {
+        // MAPI requires the names and entry list properties to contain the same usable
+        // recipients in the same order. Invalid addresses are reported by the mapper and
+        // are omitted from both properties rather than creating a mismatched pair.
+        List<MailAddress> usable = replyTo
+            .Where(address => !string.IsNullOrWhiteSpace(address.Email))
+            .ToList();
+        if (usable.Count == 0)
+            return;
+
+        note.PC.SetStringProperty(
+            PropertyID.PidTagReplyRecipientNames,
+            string.Join("; ", usable.Select(GetDisplayName)));
+        note.PC.SetBytesProperty(
+            PropertyID.PidTagReplyRecipientEntries,
+            BuildReplyRecipientEntries(usable));
+    }
+
+    private static byte[] BuildReplyRecipientEntries(IReadOnlyList<MailAddress> recipients)
+    {
+        List<byte[]> entryIds = recipients
+            .Select(address => RecipientEntryID.GetEntryID(GetDisplayName(address), address.Email).GetBytes())
+            .ToList();
+
+        int flatEntriesSize = entryIds.Sum(entryId => Align4(sizeof(uint) + entryId.Length));
+        byte[] result = new byte[sizeof(uint) * 2 + flatEntriesSize];
+        BinaryPrimitives.WriteUInt32LittleEndian(result.AsSpan(0, sizeof(uint)), (uint)entryIds.Count);
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            result.AsSpan(sizeof(uint), sizeof(uint)), (uint)flatEntriesSize);
+
+        int offset = sizeof(uint) * 2;
+        foreach (byte[] entryId in entryIds)
+        {
+            int flatEntryLength = sizeof(uint) + entryId.Length;
+            BinaryPrimitives.WriteUInt32LittleEndian(
+                result.AsSpan(offset, sizeof(uint)), (uint)entryId.Length);
+            entryId.CopyTo(result, offset + sizeof(uint));
+            offset += Align4(flatEntryLength);
+        }
+
+        return result;
+    }
+
+    private static int Align4(int value) => (value + 3) & ~3;
+
     private void WriteMessage(PSTFile file, PSTFolder folder, MailMessage message)
     {
         // Pre-flight: reject a message carrying an unrepresentable attachment BEFORE creating
@@ -710,24 +812,14 @@ public class PstWriter
         string sanitizedSubject = SanitizeSubject(message.Subject);
         note.Subject = sanitizedSubject;
 
+        // Keep the MAPI distinction between the actual transport sender and the author
+        // represented by From. For ordinary messages Sender is null, so both groups retain
+        // the historical From values. A valid MIME Sender overrides only Sender*.
+        MailAddress? actualSender = message.Sender ?? message.From;
+        if (actualSender is not null)
+            SetSenderProperties(note, actualSender, sentRepresenting: false);
         if (message.From is not null)
-        {
-            // A malformed/empty From header (e.g. "From: <>") can yield an empty email.
-            // Only claim an SMTP sender address when we actually have one — otherwise we'd
-            // write an "SMTP" address type with an empty address, which Outlook renders oddly.
-            string email = message.From.Email;
-            bool hasEmail = !string.IsNullOrWhiteSpace(email);
-            string senderName = message.From.Name ?? (hasEmail ? email : string.Empty);
-            note.SenderName = senderName;
-            note.SentRepresentingName = senderName;
-            if (hasEmail)
-            {
-                note.SenderAddressType = "SMTP";
-                note.SenderEmailAddress = email;
-                note.SentRepresentingAddressType = "SMTP";
-                note.SentRepresentingEmailAddress = email;
-            }
-        }
+            SetSenderProperties(note, message.From, sentRepresenting: true);
 
         note.Body = GetPlainTextBody(message);
 
@@ -747,7 +839,7 @@ public class PstWriter
 
         static IEnumerable<MessageRecipient> ToRecipients(IEnumerable<MailAddress> addresses, RecipientType type) =>
             addresses.Select(address =>
-                new MessageRecipient(address.Name ?? address.Email, address.Email, isOrganizer: false, type));
+                new MessageRecipient(GetDisplayName(address), address.Email, isOrganizer: false, type));
 
         List<MessageRecipient> recipients = ToRecipients(message.To, RecipientType.To)
             .Concat(ToRecipients(message.Cc, RecipientType.Cc))
@@ -758,6 +850,8 @@ public class PstWriter
         {
             note.AddRecipients(recipients);
         }
+
+        WriteReplyRecipients(note, message.ReplyTo);
 
         if (message.MessageId is not null)
             note.PC.SetStringProperty(PropertyID.PidTagInternetMessageId, message.MessageId);

@@ -53,6 +53,9 @@ public static class ConfigFromDiscovery
                 group.MaxSizeMB = t.MaxSizeMB;
                 group.IncludeEmptyFolders = t.IncludeEmptyFolders;
                 group.FolderMapping = t.FolderMapping;
+                group.GmailLabelMode = t.GmailLabelMode;
+                group.GmailPrimaryLabelPriority =
+                    (t.GmailPrimaryLabelPriority ?? new List<string>()).ToList();
 
                 // Copy template contacts onto the group (template sources are discarded;
                 // template contacts are preserved so "template wins" check below works).

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #nullable enable
 
+using System;
+
 namespace Mail2Pst.Core.Parsing.Mbox;
 
 /// <summary>One result from the mbox boundary engine: either a materialized message buffer
@@ -13,14 +15,23 @@ internal readonly struct MessageChunk
     public bool IsOversized { get; }
     /// <summary>Approximate content bytes seen before the message was cut off (for the skip message).</summary>
     public long OversizedBytes { get; }
+    public DateTimeOffset? EnvelopeDate { get; }
 
-    private MessageChunk(SpillableMessageBuffer? buffer, bool oversized, long bytes)
+    private MessageChunk(
+        SpillableMessageBuffer? buffer,
+        bool oversized,
+        long bytes,
+        DateTimeOffset? envelopeDate)
     {
         Buffer = buffer;
         IsOversized = oversized;
         OversizedBytes = bytes;
+        EnvelopeDate = envelopeDate;
     }
 
-    public static MessageChunk Ok(SpillableMessageBuffer? buffer) => new(buffer, false, 0);
-    public static MessageChunk Oversized(long bytes) => new(null, true, bytes);
+    public static MessageChunk Ok(SpillableMessageBuffer? buffer, DateTimeOffset? envelopeDate) =>
+        new(buffer, false, 0, envelopeDate);
+
+    public static MessageChunk Oversized(long bytes, DateTimeOffset? envelopeDate) =>
+        new(null, true, bytes, envelopeDate);
 }

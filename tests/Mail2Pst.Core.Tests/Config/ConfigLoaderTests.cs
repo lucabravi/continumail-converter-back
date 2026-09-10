@@ -48,6 +48,7 @@ public class ConfigLoaderTests
             Assert.Equal("Personal", personal.Name);
             Assert.Equal(100, personal.MaxSizeMB);
             Assert.Equal(FolderMappingMode.Mirror, personal.FolderMapping);
+            Assert.Equal(GmailLabelMode.Compact, personal.GmailLabelMode);
             Assert.Equal(2, personal.Sources.Count);
             Assert.Equal("extracted/Inbox.mbox", personal.Sources[0].Path);
             Assert.Equal("mbox", personal.Sources[0].Type);
@@ -61,6 +62,26 @@ public class ConfigLoaderTests
         {
             File.Delete(tempPath);
         }
+    }
+
+    [Fact]
+    public void Load_ParsesGmailLabelModeAndPrimaryPriority()
+    {
+        string json = """
+        { "outputs": [ { "name": "Out", "maxSizeMB": 100,
+          "gmailLabelMode": "ExactFolders",
+          "gmailPrimaryLabelPriority": ["INBOX/WORK", "Posta in arrivo"],
+          "sources": [ { "path": "a.mbox", "type": "mbox" } ] } ] }
+        """;
+        string tempPath = Path.GetTempFileName();
+        File.WriteAllText(tempPath, json);
+        try
+        {
+            OutputGroupConfig output = Assert.Single(ConfigLoader.Load(tempPath).Outputs);
+            Assert.Equal(GmailLabelMode.ExactFolders, output.GmailLabelMode);
+            Assert.Equal(new[] { "INBOX/WORK", "Posta in arrivo" }, output.GmailPrimaryLabelPriority);
+        }
+        finally { File.Delete(tempPath); }
     }
 
     [Fact]

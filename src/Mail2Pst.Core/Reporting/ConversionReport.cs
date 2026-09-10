@@ -38,6 +38,12 @@ public class ConversionReport
     private readonly List<string> _calendarCategoryNames = new();
     private readonly HashSet<string> _calendarCategorySeen = new(StringComparer.OrdinalIgnoreCase);
 
+    private int _gmailSourcesDetected;
+    private long _gmailSourceMessages, _gmailLabeledMessages, _gmailMessagesWithoutLabels;
+    private long _gmailLabelAssignments, _gmailPstCopiesPlanned, _gmailDuplicateCopiesPlanned;
+    private readonly List<string> _gmailLabelNames = new();
+    private readonly HashSet<string> _gmailLabelNamesSeen = new(StringComparer.OrdinalIgnoreCase);
+
     public int ConvertedCount => Volatile.Read(ref _convertedCount);
 
     // Contact counters (Task 14 fills the full surface; Task 7 stub kept compatible).
@@ -68,6 +74,7 @@ public class ConversionReport
     public IReadOnlyList<SkippedMessage> Warnings { get { lock (_lock) return _warnings.ToArray(); } }
     public IReadOnlyList<string> OutputFiles { get { lock (_lock) return _outputFiles.ToArray(); } }
     public IReadOnlyList<string> CalendarCategoryNames { get { lock (_lock) return _calendarCategoryNames.ToArray(); } }
+    public IReadOnlyList<string> GmailLabelNames { get { lock (_lock) return _gmailLabelNames.ToArray(); } }
 
     public void AddOutputFiles(IEnumerable<string> files)
     {
@@ -137,6 +144,48 @@ public class ConversionReport
                 if (string.IsNullOrWhiteSpace(n)) continue; // ignore empty/whitespace-only (would hash to hashColor(" "))
                 if (_calendarCategorySeen.Add(n)) _calendarCategoryNames.Add(n);
             }
+        }
+    }
+
+    public void RecordGmailLabelSource(
+        long sourceMessages,
+        long labeledMessages,
+        long labelAssignments,
+        long pstCopiesPlanned,
+        IEnumerable<string> labelNames)
+    {
+        // A source with no X-Gmail-Labels at all is an ordinary source, not a Gmail source with
+        // thousands of "missing" labels. Only detected sources contribute to this summary.
+        if (labeledMessages <= 0)
+            return;
+
+        lock (_lock)
+        {
+            _gmailSourcesDetected++;
+            _gmailSourceMessages += sourceMessages;
+            _gmailLabeledMessages += labeledMessages;
+            _gmailMessagesWithoutLabels += System.Math.Max(0, sourceMessages - labeledMessages);
+            _gmailLabelAssignments += labelAssignments;
+            _gmailPstCopiesPlanned += pstCopiesPlanned;
+            _gmailDuplicateCopiesPlanned += System.Math.Max(0, pstCopiesPlanned - sourceMessages);
+            foreach (string label in labelNames)
+                if (_gmailLabelNamesSeen.Add(label)) _gmailLabelNames.Add(label);
+        }
+    }
+
+    public GmailLabelSummary GmailLabels
+    {
+        get
+        {
+            lock (_lock)
+                return new GmailLabelSummary(
+                    _gmailSourcesDetected,
+                    _gmailSourceMessages,
+                    _gmailLabeledMessages,
+                    _gmailMessagesWithoutLabels,
+                    _gmailLabelAssignments,
+                    _gmailPstCopiesPlanned,
+                    _gmailDuplicateCopiesPlanned);
         }
     }
 
@@ -213,6 +262,18 @@ public class ConversionReport
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
             WriteIndented = true,
         };
+        var warningSummary = GroupWarnings(warnings)
+            .Select(group => new
+            {
+                code = group.Key,
+                count = group.Count(),
+                examples = group.Take(3).Select(w => new
+                {
+                    source = w.SourcePath,
+                    identifier = w.Identifier,
+                    reason = w.Reason,
+                }),
+            });
         return JsonSerializer.Serialize(new
         {
             converted = ConvertedCount,
@@ -226,7 +287,16 @@ public class ConversionReport
             tasksSkipped = TasksSkipped,
             taskWarnings = TaskWarningCount,
             skipped = skipped.Select(s => new { source = s.SourcePath, identifier = s.Identifier, reason = s.Reason }),
-            warnings = warnings.Select(w => new { source = w.SourcePath, identifier = w.Identifier, reason = w.Reason }),
+            warnings = warnings.Select(w => new
+            {
+                source = w.SourcePath,
+                identifier = w.Identifier,
+                code = WarningCode(w.Reason),
+                reason = w.Reason,
+            }),
+            warningSummary,
+            gmailLabels = GmailLabels,
+            gmailLabelNames = GmailLabelNames,
             enrichment = EnrichmentSummary,
         }, options);
     }
@@ -253,10 +323,24 @@ public class ConversionReport
 
         builder.AppendLine($"Warnings: {warnings.Length}");
 
+        if (warnings.Length > 0)
+        {
+            builder.AppendLine("Warning summary:");
+            foreach (IGrouping<string, SkippedMessage> group in GroupWarnings(warnings))
+                builder.AppendLine($"  {group.Key}: {group.Count()}");
+        }
+
         foreach (SkippedMessage warning in warnings)
         {
             builder.AppendLine($"  WARN {warning.SourcePath} [{warning.Identifier}]: {warning.Reason}");
         }
+
+        GmailLabelSummary gmail = GmailLabels;
+        builder.AppendLine(
+            $"Gmail labels: sources={gmail.SourcesDetected} sourceMessages={gmail.SourceMessages} " +
+            $"labeled={gmail.LabeledMessages} withoutLabels={gmail.MessagesWithoutLabels} " +
+            $"assignments={gmail.LabelAssignments} plannedPstCopies={gmail.PstCopiesPlanned} " +
+            $"duplicateCopies={gmail.DuplicateCopiesPlanned}");
 
         MsfEnrichmentSummary enr = EnrichmentSummary;
         builder.AppendLine(
@@ -268,5 +352,30 @@ public class ConversionReport
             $"lofDisabled={enr.LiveOffsetFilterDisabledSources} dupLiveOffsets={enr.DuplicateLiveOffsets}");
 
         return builder.ToString();
+    }
+
+    private static IEnumerable<IGrouping<string, SkippedMessage>> GroupWarnings(
+        IEnumerable<SkippedMessage> warnings) =>
+        warnings
+            .GroupBy(warning => WarningCode(warning.Reason), StringComparer.Ordinal)
+            .OrderByDescending(group => group.Count())
+            .ThenBy(group => group.Key, StringComparer.Ordinal);
+
+    private static string WarningCode(string reason)
+    {
+        const string integrityPrefix = "[integrity:";
+        if (reason.StartsWith(integrityPrefix, StringComparison.Ordinal))
+        {
+            int end = reason.IndexOf(']');
+            if (end > integrityPrefix.Length)
+                return reason.Substring(integrityPrefix.Length, end - integrityPrefix.Length);
+        }
+
+        // Attachment extraction warnings predate the integrity warning prefix. Keep their
+        // reason text backward-compatible while still giving the report a useful category.
+        if (reason.StartsWith("Dropped attachment", StringComparison.Ordinal))
+            return "attachment-dropped";
+
+        return "general";
     }
 }

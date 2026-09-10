@@ -18,10 +18,10 @@ namespace Mail2Pst.Integration.Tests;
 ///  - No raw control characters: PidTagSubject legitimately BEGINS with the MS-PST
 ///    subject-prefix marker 0x01 0x01 (added by the vendored Subject setter), so control
 ///    bytes coming from a mangled source header corrupt the prefix decoding.
-///  - MAPI length cap: a subject long enough to push the contents-table row cell past the
-///    heap allocation limit spills the cell to a subnode, which scanpst rejects as
-///    "row doesn't match sub-object" (seen in the wild: a 2,700-char LinkedIn subject).
-///    Outlook truncates subjects to 255 chars (including the 2-char prefix) — so must we.
+///  - Writer/PST compatibility cap: a subject long enough to push the contents-table row cell
+///    past the heap allocation limit spills the cell to a subnode, which scanpst rejects as
+///    "row doesn't match sub-object" (seen in the wild: a 2,700-char LinkedIn subject). The
+///    writer therefore keeps a 253-character source-value limit after its 2-character prefix.
 /// </summary>
 public class SubjectSanitizationTests
 {

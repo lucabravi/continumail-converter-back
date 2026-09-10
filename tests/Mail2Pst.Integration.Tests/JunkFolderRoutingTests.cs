@@ -20,7 +20,10 @@ public class JunkFolderRoutingTests
         "{1:^80 {(k^96:c)} [1(^88=5)(^89=a@h)(^8A=90)(^8B=work)] }";
 
     private static string Msg(string id, string body) =>
-        $"From s@e Thu Jan 01 00:00:00 2026\nMessage-ID: {id}\nSubject: t\n\n{body}\n";
+        $"From s@e Thu Jan 01 00:00:00 2026\n" +
+        $"From: sender@example.com\nTo: recipient@example.com\n" +
+        $"Date: Thu, 01 Jan 2026 00:00:00 +0000\n" +
+        $"Message-ID: {id}\nSubject: t\n\n{body}\n";
 
     private static string WriteTemp(string content, string ext)
     {

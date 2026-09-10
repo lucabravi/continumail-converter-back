@@ -46,6 +46,199 @@ public class MimeMessageMapperTests
     }
 
     [Fact]
+    public void Map_MapsSenderAndReplyTo_AndDoesNotWarnForSourceFieldsThatAreEmpty()
+    {
+        var mime = new MimeMessage();
+        mime.From.Add(new MailboxAddress(string.Empty, "from@example.com"));
+        mime.Sender = new MailboxAddress("Actual sender", "sender@example.com");
+        mime.ReplyTo.Add(new MailboxAddress("Reply address", "reply@example.com"));
+        mime.Subject = string.Empty;
+        while (mime.Headers.Contains(HeaderId.Date)) mime.Headers.Remove(HeaderId.Date);
+        while (mime.Headers.Contains(HeaderId.MessageId)) mime.Headers.Remove(HeaderId.MessageId);
+
+        var warnings = new List<string>();
+        MailMessage m = Map(mime, warnings);
+
+        Assert.Equal("from@example.com", m.From!.Email);
+        Assert.Equal("sender@example.com", m.Sender!.Email);
+        Assert.Equal("reply@example.com", Assert.Single(m.ReplyTo).Email);
+        Assert.Empty(m.To);
+        Assert.Null(m.Date);
+        Assert.Null(m.TextBody);
+        Assert.Null(m.HtmlBody);
+        Assert.Empty(warnings);
+    }
+
+    [Fact]
+    public void Map_MultipleRecipientsAndReplyTo_PreservesAllMailboxesInOrder()
+    {
+        var mime = new MimeMessage { Subject = "multiple" };
+        mime.From.Add(new MailboxAddress("Sender", "sender@example.com"));
+        mime.To.Add(new MailboxAddress("To one", "to-one@example.com"));
+        mime.To.Add(new MailboxAddress("To two", "to-two@example.com"));
+        mime.Cc.Add(new MailboxAddress("Cc one", "cc-one@example.com"));
+        mime.Cc.Add(new MailboxAddress("Cc two", "cc-two@example.com"));
+        mime.Bcc.Add(new MailboxAddress("Bcc one", "bcc-one@example.com"));
+        mime.Bcc.Add(new MailboxAddress("Bcc two", "bcc-two@example.com"));
+        mime.ReplyTo.Add(new MailboxAddress("Reply one", "reply-one@example.com"));
+        mime.ReplyTo.Add(new MailboxAddress("Reply two", "reply-two@example.com"));
+        mime.Date = new DateTimeOffset(2024, 1, 2, 3, 4, 5, TimeSpan.Zero);
+        mime.MessageId = "multiple@example.com";
+        mime.Body = new TextPart("plain") { Text = "body" };
+
+        var warnings = new List<string>();
+        MailMessage m = Map(mime, warnings);
+
+        Assert.Equal(new[] { "to-one@example.com", "to-two@example.com" },
+            m.To.Select(address => address.Email));
+        Assert.Equal(new[] { "cc-one@example.com", "cc-two@example.com" },
+            m.Cc.Select(address => address.Email));
+        Assert.Equal(new[] { "bcc-one@example.com", "bcc-two@example.com" },
+            m.Bcc.Select(address => address.Email));
+        Assert.Equal(new[] { "reply-one@example.com", "reply-two@example.com" },
+            m.ReplyTo.Select(address => address.Email));
+        Assert.DoesNotContain(warnings, w => w.StartsWith("[integrity:recipient-", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Map_DeliveredToFallback_RecoversRecipientsWithoutWarning()
+    {
+        const string raw =
+            "From: sender@example.com\r\n" +
+            "To: Example Person\r\n" +
+            "Delivered-To: sample.recipient@example.invalid\r\n" +
+            "Date: Thu, 2 Jan 2020 03:04:05 +0000\r\n" +
+            "Message-ID: <delivered-to@example.com>\r\n" +
+            "Subject: delivered-to fallback\r\n\r\nbody\r\n";
+        MimeMessage mime = MimeMessage.Load(new MemoryStream(Encoding.ASCII.GetBytes(raw)));
+        var warnings = new List<string>();
+
+        MailMessage mapped = Map(mime, warnings);
+
+        MailAddress recipient = Assert.Single(mapped.To);
+        Assert.Equal("sample.recipient@example.invalid", recipient.Email);
+        Assert.Empty(warnings);
+    }
+
+    [Fact]
+    public void Map_DeliveredToFallback_PreservesDistinctRepeatedAddresses()
+    {
+        var mime = new MimeMessage { Subject = "delivered-to fallback" };
+        mime.From.Add(new MailboxAddress("Sender", "sender@example.com"));
+        mime.Headers.Add("Delivered-To", "first@example.com");
+        mime.Headers.Add("Delivered-To", "second@example.com");
+        mime.Date = new DateTimeOffset(2024, 1, 2, 3, 4, 5, TimeSpan.Zero);
+        mime.MessageId = "delivered-to-repeat@example.com";
+        mime.Body = new TextPart("plain") { Text = "body" };
+
+        var warnings = new List<string>();
+        MailMessage mapped = Map(mime, warnings);
+
+        Assert.Equal(new[] { "first@example.com", "second@example.com" },
+            mapped.To.Select(address => address.Email));
+        Assert.Empty(warnings);
+    }
+
+    [Fact]
+    public void Map_InvalidDeliveredToFallback_ReportsThatFallbackCause()
+    {
+        var mime = new MimeMessage { Subject = "invalid delivered-to" };
+        mime.From.Add(new MailboxAddress("Sender", "sender@example.com"));
+        mime.Headers.Add("Delivered-To", "Example Person");
+        mime.Date = new DateTimeOffset(2024, 1, 2, 3, 4, 5, TimeSpan.Zero);
+        mime.MessageId = "invalid-delivered-to@example.com";
+        mime.Body = new TextPart("plain") { Text = "body" };
+
+        var warnings = new List<string>();
+        Map(mime, warnings);
+
+        string warning = Assert.Single(warnings, item =>
+            item.StartsWith("[integrity:recipients-missing]", StringComparison.Ordinal));
+        Assert.Contains("Delivered-To fallback", warning);
+        Assert.Contains("parsedMailboxes=0", warning);
+    }
+
+    [Fact]
+    public void Map_BareFromWithValidAddressDoesNotReportMissingFrom()
+    {
+        var mime = new MimeMessage { Subject = "subject" };
+        mime.From.Add(new MailboxAddress(string.Empty, "bare@example.com"));
+        mime.To.Add(new MailboxAddress("Recipient", "to@example.com"));
+        mime.Date = new DateTimeOffset(2024, 1, 2, 3, 4, 5, TimeSpan.Zero);
+        mime.MessageId = "message@example.com";
+        mime.Body = new TextPart("plain") { Text = "body" };
+
+        var warnings = new List<string>();
+        MailMessage m = Map(mime, warnings);
+
+        Assert.Equal("bare@example.com", m.From!.Email);
+        Assert.DoesNotContain(warnings, w => w.StartsWith("[integrity:from-", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Map_OverlongSubject_ReportsTruncationCauseAndCount()
+    {
+        var mime = new MimeMessage { Subject = new string('x', 257) };
+        mime.From.Add(new MailboxAddress("From", "from@example.com"));
+        mime.To.Add(new MailboxAddress("Recipient", "to@example.com"));
+        mime.Date = new DateTimeOffset(2024, 1, 2, 3, 4, 5, TimeSpan.Zero);
+        mime.MessageId = "subject@example.com";
+        mime.Body = new TextPart("plain") { Text = "body" };
+
+        var warnings = new List<string>();
+        Map(mime, warnings);
+
+        string warning = Assert.Single(warnings, item =>
+            item.StartsWith("[integrity:subject-truncated]", StringComparison.Ordinal));
+        Assert.Contains("sourceLength=257", warning);
+        Assert.Contains("maximum=253", warning);
+        Assert.Contains("truncatedCharacters=4", warning);
+        Assert.Contains("resultingLength=253", warning);
+        Assert.DoesNotContain(warnings, item =>
+            item.StartsWith("[integrity:subject-control-characters]", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Map_SubjectControlCharacters_ReportsRemovalCauseSeparately()
+    {
+        var mime = new MimeMessage { Subject = "safe" + (char)0x01 + "subject" };
+        mime.From.Add(new MailboxAddress("From", "from@example.com"));
+        mime.To.Add(new MailboxAddress("Recipient", "to@example.com"));
+        mime.Date = new DateTimeOffset(2024, 1, 2, 3, 4, 5, TimeSpan.Zero);
+        mime.MessageId = "subject-control@example.com";
+        mime.Body = new TextPart("plain") { Text = "body" };
+
+        var warnings = new List<string>();
+        Map(mime, warnings);
+
+        string warning = Assert.Single(warnings, item =>
+            item.StartsWith("[integrity:subject-control-characters]", StringComparison.Ordinal));
+        Assert.Contains("control character(s)", warning);
+        Assert.Contains("sourceLength=12", warning);
+        Assert.Contains("resultingLength=11", warning);
+        Assert.DoesNotContain(warnings, item =>
+            item.StartsWith("[integrity:subject-truncated]", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Map_InvalidReplyTo_ReportsRawHeaderCauseAndAction()
+    {
+        var mime = new MimeMessage { Subject = "invalid addresses" };
+        mime.From.Add(new MailboxAddress("From", "from@example.com"));
+        mime.Headers.Add("Reply-To", "also not an address");
+        mime.To.Add(new MailboxAddress("Recipient", "to@example.com"));
+        mime.Body = new TextPart("plain") { Text = "body" };
+
+        var warnings = new List<string>();
+        Map(mime, warnings);
+
+        string replyToWarning = Assert.Single(warnings, w => w.StartsWith("[integrity:reply-to-invalid]", StringComparison.Ordinal));
+        Assert.Contains("Reply-To=present", replyToWarning);
+        Assert.Contains("also not an address", replyToWarning);
+        Assert.Contains("no PST reply-recipient list", replyToWarning);
+    }
+
+    [Fact]
     public void Map_ThreadingHeaders_NormalizedWithAngleBrackets()
     {
         var mime = new MimeMessage { Subject = "t" };
@@ -61,6 +254,48 @@ public class MimeMessageMapperTests
         Assert.Equal("<msg-1@x.com>", m.MessageId);
         Assert.Equal("<parent@x.com>", m.InReplyTo);
         Assert.Equal("<r1@x.com> <r2@x.com>", m.References);
+    }
+
+    [Fact]
+    public void Map_ThreadingHeaders_RecoversBareAndRfc2047EncodedValues()
+    {
+        const string raw =
+            "From: sender@example.com\r\n" +
+            "To: recipient@example.com\r\n" +
+            "Date: Thu, 2 Jan 2020 03:04:05 +0000\r\n" +
+            "Message-ID: <current@example.com>\r\n" +
+            "In-Reply-To: parent@mail.gmail.com\r\n" +
+            "References: =?iso-8859-1?q?=3Cfirst=40mail=2Egmail=2Ecom=3E_=3Csecond=40example=2Ecom=3E?=\r\n" +
+            "Subject: threading\r\n\r\nbody\r\n";
+        MimeMessage mime = MimeMessage.Load(new MemoryStream(Encoding.ASCII.GetBytes(raw)));
+        var warnings = new List<string>();
+
+        MailMessage mapped = Map(mime, warnings);
+
+        Assert.Equal("<parent@mail.gmail.com>", mapped.InReplyTo);
+        Assert.Equal("<first@mail.gmail.com> <second@example.com>", mapped.References);
+        Assert.DoesNotContain(warnings, warning => warning.StartsWith("[integrity:in-reply-to-", StringComparison.Ordinal));
+        Assert.DoesNotContain(warnings, warning => warning.StartsWith("[integrity:references-", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Map_ThreadingHeaders_LeavesNonMessageIdValueEmptyAndWarns()
+    {
+        const string raw =
+            "From: sender@example.com\r\n" +
+            "To: recipient@example.com\r\n" +
+            "Date: Thu, 2 Jan 2020 03:04:05 +0000\r\n" +
+            "Message-ID: <current@example.com>\r\n" +
+            "In-Reply-To: 11.111512\r\n" +
+            "Subject: threading\r\n\r\nbody\r\n";
+        MimeMessage mime = MimeMessage.Load(new MemoryStream(Encoding.ASCII.GetBytes(raw)));
+        var warnings = new List<string>();
+
+        MailMessage mapped = Map(mime, warnings);
+
+        Assert.Null(mapped.InReplyTo);
+        string warning = Assert.Single(warnings, item => item.StartsWith("[integrity:in-reply-to-invalid]", StringComparison.Ordinal));
+        Assert.Contains("11.111512", warning);
     }
 
     [Fact]
@@ -105,6 +340,49 @@ public class MimeMessageMapperTests
         bare.From.Add(new MailboxAddress("A", "a@x.com"));
         bare.Body = new TextPart("plain") { Text = "b" };
         Assert.True(Map(bare).IsRead);
+    }
+
+    [Fact]
+    public void Map_GmailLabels_PreservesOrderAcrossRepeatedHeadersAndDeduplicatesCaseInsensitively()
+    {
+        var mime = new MimeMessage { Subject = "labels" };
+        mime.From.Add(new MailboxAddress("A", "a@x.com"));
+        mime.Headers.Add("X-Gmail-Labels", "Posta in arrivo, Importanti,INBOX/AMMINISTRAZIONE");
+        mime.Headers.Add("X-Gmail-Labels", "importanti,Speciali");
+        mime.Body = new TextPart("plain") { Text = "body" };
+
+        MailMessage mapped = Map(mime);
+
+        Assert.True(mapped.HasGmailLabelsHeader);
+        Assert.Equal(
+            new[] { "Posta in arrivo", "Importanti", "INBOX/AMMINISTRAZIONE", "Speciali" },
+            mapped.GmailLabels);
+    }
+
+    [Fact]
+    public void Map_GmailLabels_EmptySourceIsSilentButNonEmptyUnusableSourceWarns()
+    {
+        var empty = new MimeMessage { Subject = "empty labels" };
+        empty.From.Add(new MailboxAddress("A", "a@x.com"));
+        empty.Headers.Add("X-Gmail-Labels", "   ");
+        var emptyWarnings = new List<string>();
+
+        MailMessage emptyMapped = Map(empty, emptyWarnings);
+
+        Assert.True(emptyMapped.HasGmailLabelsHeader);
+        Assert.Empty(emptyMapped.GmailLabels);
+        Assert.DoesNotContain(emptyWarnings, warning => warning.Contains("gmail-label", StringComparison.Ordinal));
+
+        var unusable = new MimeMessage { Subject = "unusable labels" };
+        unusable.From.Add(new MailboxAddress("A", "a@x.com"));
+        unusable.Headers.Add("X-Gmail-Labels", ",,,");
+        var unusableWarnings = new List<string>();
+
+        MailMessage unusableMapped = Map(unusable, unusableWarnings);
+
+        Assert.Empty(unusableMapped.GmailLabels);
+        Assert.Contains(unusableWarnings,
+            warning => warning.StartsWith("[integrity:gmail-labels-unparsed]", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -174,6 +452,49 @@ public class MimeMessageMapperTests
         Assert.Single(warnings);
         Assert.Contains("broken.bin", warnings[0]);
         Assert.Contains("application/octet-stream", warnings[0]);
+    }
+
+    [Fact]
+    public void ExtractAttachments_ExplicitAttachmentWithoutFilename_UsesGeneratedNameWithoutWarning()
+    {
+        var mime = new MimeMessage();
+        var multipart = new Multipart("mixed");
+        multipart.Add(new TextPart("plain") { Text = "body" });
+        multipart.Add(new MimePart("application", "octet-stream")
+        {
+            Content = new MimeContent(new MemoryStream(new byte[] { 1, 2, 3 })),
+            ContentDisposition = new ContentDisposition(ContentDisposition.Attachment),
+        });
+        mime.Body = multipart;
+
+        var warnings = new List<string>();
+        List<MailAttachment> attachments = new MimeMessageMapper().ExtractAttachments(mime, warnings);
+
+        Assert.Equal("attachment-1", Assert.Single(attachments).FileName);
+        Assert.Empty(warnings);
+    }
+
+    [Fact]
+    public void ExtractAttachments_UnnamedCidImageReferencedByHtml_IsInlineWithoutWarning()
+    {
+        var mime = new MimeMessage();
+        var multipart = new Multipart("mixed");
+        multipart.Add(new TextPart("html") { Text = "<img src=\"cid:ii_image\">" });
+        multipart.Add(new MimePart("image", "png")
+        {
+            Content = new MimeContent(new MemoryStream(new byte[] { 1, 2, 3 })),
+            ContentDisposition = new ContentDisposition(ContentDisposition.Attachment),
+            ContentId = "ii_image",
+        });
+        mime.Body = multipart;
+
+        var warnings = new List<string>();
+        List<MailAttachment> attachments = new MimeMessageMapper().ExtractAttachments(mime, warnings);
+
+        MailAttachment image = Assert.Single(attachments);
+        Assert.Equal("attachment-1.png", image.FileName);
+        Assert.True(image.IsInline);
+        Assert.Empty(warnings);
     }
 
     [Fact]

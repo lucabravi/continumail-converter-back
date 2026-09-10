@@ -80,4 +80,52 @@ public class ConversionReportJsonTests
         Assert.Equal("message #3", warning.GetProperty("identifier").GetString());
         Assert.Equal("dropped attachment", warning.GetProperty("reason").GetString());
     }
+
+    [Fact]
+    public void ToJson_WarningsIncludeCodesAndGroupedExamples()
+    {
+        var report = new ConversionReport();
+        report.RecordWarning(new SourceReference { SourcePath = "Inbox.mbox", Identifier = "message #1" },
+            "[integrity:subject-missing] Subject is absent; the PST subject will be empty.");
+        report.RecordWarning(new SourceReference { SourcePath = "Inbox.mbox", Identifier = "message #2" },
+            "[integrity:subject-missing] Subject is present but empty; the PST subject will be empty.");
+        report.RecordWarning(new SourceReference { SourcePath = "Inbox.mbox", Identifier = "message #3" },
+            "Dropped attachment #1 'broken.bin' (application/octet-stream): cause=bad content");
+
+        using var doc = JsonDocument.Parse(report.ToJson());
+        JsonElement root = doc.RootElement;
+
+        Assert.Equal("subject-missing", root.GetProperty("warnings")[0].GetProperty("code").GetString());
+
+        JsonElement summary = root.GetProperty("warningSummary");
+        Assert.Equal(2, summary.GetArrayLength());
+        JsonElement subject = Assert.Single(summary.EnumerateArray(), item => item.GetProperty("code").GetString() == "subject-missing");
+        Assert.Equal(2, subject.GetProperty("count").GetInt32());
+        Assert.Equal(2, subject.GetProperty("examples").GetArrayLength());
+        JsonElement attachment = Assert.Single(summary.EnumerateArray(), item => item.GetProperty("code").GetString() == "attachment-dropped");
+        Assert.Equal(1, attachment.GetProperty("count").GetInt32());
+    }
+
+    [Fact]
+    public void ToJson_GroupsSubjectWarningCausesSeparately()
+    {
+        var report = new ConversionReport();
+        report.RecordWarning(new SourceReference { SourcePath = "Inbox.mbox", Identifier = "message #1" },
+            "[integrity:subject-truncated] Subject exceeds the PST compatibility limit.");
+        report.RecordWarning(new SourceReference { SourcePath = "Inbox.mbox", Identifier = "message #2" },
+            "[integrity:subject-truncated] Subject exceeds the PST compatibility limit.");
+        report.RecordWarning(new SourceReference { SourcePath = "Inbox.mbox", Identifier = "message #3" },
+            "[integrity:subject-control-characters] Subject contains control characters.");
+
+        using var doc = JsonDocument.Parse(report.ToJson());
+        JsonElement summary = doc.RootElement.GetProperty("warningSummary");
+
+        JsonElement truncated = Assert.Single(summary.EnumerateArray(), item =>
+            item.GetProperty("code").GetString() == "subject-truncated");
+        Assert.Equal(2, truncated.GetProperty("count").GetInt32());
+
+        JsonElement controls = Assert.Single(summary.EnumerateArray(), item =>
+            item.GetProperty("code").GetString() == "subject-control-characters");
+        Assert.Equal(1, controls.GetProperty("count").GetInt32());
+    }
 }

@@ -33,6 +33,15 @@ public static class MappingEngine
                 IncludeEmptyFolders = output.IncludeEmptyFolders,
             };
 
+            if (output.GmailLabelMode == GmailLabelMode.ExactFolders)
+            {
+                plan.PlanningWarnings.Add(
+                    "[integrity:gmail-label-exact-mode-space] Gmail ExactFolders mode writes one full PST item " +
+                    "for every X-Gmail-Labels membership. Message bodies and attachments are duplicated; " +
+                    "the output can consume substantially more disk space and may be split into additional PST files. " +
+                    "Use Compact mode to keep one physical copy and preserve labels as Outlook categories.");
+            }
+
             var usedMailKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (SourceConfig source in output.Sources ?? new List<SourceConfig>())
             {
@@ -82,7 +91,13 @@ public static class MappingEngine
                 }
                 usedMailKeys.Add(FolderPathKey.Join(targetPath));
 
-                plan.SourceMappings.Add(new SourceMapping { Source = source, TargetFolderPath = targetPath });
+                plan.SourceMappings.Add(new SourceMapping
+                {
+                    Source = source,
+                    TargetFolderPath = targetPath,
+                    GmailLabelMode = output.GmailLabelMode,
+                    GmailPrimaryLabelPriority = (output.GmailPrimaryLabelPriority ?? new List<string>()).ToArray(),
+                });
             }
 
             // Build contact mappings.

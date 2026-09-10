@@ -32,7 +32,7 @@ _Thunderbird messages → PST mail items_
 ├─────────────────────────┼───────────────────────────┼───────────┼─────────────────────────────┼───────────────────────────────────────┤
 │ From / To / Cc / Bcc    │ Sender + recipients       │ Converted │                             │ recipients / PidTagSenderEmailAddress │
 ├─────────────────────────┼───────────────────────────┼───────────┼─────────────────────────────┼───────────────────────────────────────┤
-│ Date sent / received    │ Sent & received time      │ Converted │ Clamped to valid range      │ PidTagClientSubmitTime                │
+│ Date sent / received    │ Sent & received time      │ Converted │ Date header; MBOX From_ fallback       │ PidTagClientSubmitTime                │
 ├─────────────────────────┼───────────────────────────┼───────────┼─────────────────────────────┼───────────────────────────────────────┤
 │ HTML body               │ HTML body                 │ Converted │                             │ PidTagHtml                            │
 ├─────────────────────────┼───────────────────────────┼───────────┼─────────────────────────────┼───────────────────────────────────────┤
@@ -61,6 +61,29 @@ _Thunderbird messages → PST mail items_
 │ Folder structure        │ PST folder tree           │ Converted │ mirror or flatten           │ (folder hierarchy)                    │
 └─────────────────────────┴───────────────────────────┴───────────┴─────────────────────────────┴───────────────────────────────────────┘
 ```
+
+The mail mapping keeps the original converter semantics while preserving the fields that have a
+direct PST representation. A valid MIME `Sender` is written to the MAPI `Sender*` properties and
+`From` remains the `SentRepresenting*` identity. A valid `Reply-To` list is written as the paired
+MAPI reply-recipient name and `FLATENTRYLIST` properties, preserving all usable addresses and
+their order. `To`, `Cc`, and `Bcc` recipient tables likewise retain every mailbox. If those visible
+recipient lists contain no usable mailbox, valid `Delivered-To` envelope addresses are used as a
+fallback for `To`; the recipient warning is emitted only when that fallback is also unavailable or
+unparseable. For MBOX messages, a valid `Date` header remains authoritative. If it is absent or
+malformed, the MBOX `From_` envelope timestamp is used silently when it can be parsed; otherwise a
+valid `Received`/`X-Received` timestamp is used with `[integrity:date-received-fallback]`. If no
+fallback is available, `[integrity:date-missing]` is emitted and the writer default remains in effect.
+`From` is
+single-valued in the PST sender properties, so a MIME `From` with multiple mailboxes writes the
+first one and emits `[integrity:from-multiple]`. Integrity warnings are emitted only when a
+non-empty source value is missing, altered, or not representable in the PST; genuinely absent or
+empty source fields are left silent. A bare valid `From: <address>` is safe: the PST sender display
+name falls back to the address so Outlook can render the sender line. Gmail-style unnamed CID
+images referenced by the HTML are classified as hidden inline resources. Microsoft TNEF parts are
+expanded when possible while the original `winmail.dat` bytes remain preserved. Subjects exceeding
+the writer's 253-character PST compatibility limit emit `[integrity:subject-truncated]`; source
+control characters emit `[integrity:subject-control-characters]`. The report groups each warning
+code separately and includes a count plus examples.
 
 ---
 
@@ -206,3 +229,21 @@ Open the converted PST as your primary store and categories render in colour; at
 file and categorized items show their names but not their colours. See
 **[how baked-in category colours work](HOW-CATEGORY-COLOURS-WORK.md)** for the mechanism and
 **[Viewing category colours](VIEWING-CATEGORY-COLOURS.md)** for the steps. Classic Outlook on Windows only.
+
+### Gmail labels from Google Takeout
+
+`X-Gmail-Labels` is preserved without changing the underlying MIME message data. The default
+`Compact` mode writes exactly one physical PST item, assigns every source label as an Outlook
+category (`PidNameKeywords`), and chooses one label for the folder hierarchy. Selection is
+deterministic: `gmailPrimaryLabelPriority` first, then the first nested label, then the first label
+in the source header. Slash-separated labels become nested PST folders.
+
+`ExactFolders` instead writes the message into every label folder. It retains the same Message-ID,
+addresses, dates, body and attachments in each physical copy, but the report emits an explicit
+space-amplification warning and counts planned copies. `Off` leaves pre-existing folder behavior
+unchanged and does not add Gmail-label categories.
+
+Warnings are emitted only for a source value that cannot be represented unchanged (for example an
+adjusted folder name, a collision after adjustment, or an Outlook category longer than 255
+characters). Empty label headers are not warned. Phase 1 does not create Outlook Search Folders;
+category-based filtering remains available without duplicating messages.

@@ -12,4 +12,8 @@ public class PlannedMessage
 {
     public MailMessage Message { get; set; } = new();
     public IReadOnlyList<string> TargetFolderPath { get; set; } = System.Array.Empty<string>();
+    /// <summary>Additional physical destinations for an intentional multi-folder copy (currently
+    /// Gmail ExactFolders mode). The writer writes every destination before disposing attachments.</summary>
+    public IReadOnlyList<IReadOnlyList<string>> AdditionalTargetFolderPaths { get; set; } =
+        System.Array.Empty<IReadOnlyList<string>>();
 }
