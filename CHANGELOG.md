@@ -6,6 +6,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.5] — 2026-09-10
+
+### Added
+- Gmail `X-Gmail-Labels` can now be converted in **Compact** mode (the safe default, one PST
+  item with all labels as Outlook categories), **ExactFolders** mode (one physical copy in each
+  label folder), or **Off** for the legacy behavior. The conversion report includes the planned
+  physical-copy counts and label-specific warnings.
+- Mail recipient mapping now preserves multiple `To`, `Cc`, `Bcc` and `Reply-To` mailboxes. A
+  usable `Delivered-To` address is used as a `To` fallback only when no visible recipient is
+  usable.
+- Malformed or missing message dates can use the MBOX envelope timestamp, or a valid
+  `Received`/`X-Received` timestamp when available.
+
+### Changed
+- `Sender`, `Reply-To`, message threading headers and Gmail labels are mapped to their native
+  PST/MAPI representations where Outlook provides one.
+- Subjects are sanitized and truncated to the supported PST length, with a specific integrity
+  warning when source content must be shortened.
+- Integrity reporting now groups warnings by cause, includes counts and examples, and stays silent
+  for genuinely absent source fields. Date fallback warnings distinguish the `Received` fallback
+  from a date that could not be recovered.
+
+### Fixed
+- Bare sender addresses retain a usable display name in Outlook instead of appearing without a
+  sender.
+- Microsoft TNEF (`winmail.dat`) content is expanded when possible while preserving the original
+  bytes, including usable body content and attachments.
+- MBOX date parsing now handles valid envelope postmarks and avoids replacing recoverable source
+  timestamps with the writer default.
+
 ## [0.3.3] — 2026-07-23
 
 ### Security
