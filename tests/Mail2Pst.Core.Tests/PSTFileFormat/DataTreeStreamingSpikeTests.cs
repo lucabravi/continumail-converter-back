@@ -35,6 +35,167 @@ public class DataTreeStreamingSpikeTests : IDisposable
 
     public void Dispose() { try { _file?.CloseFile(); } catch { } try { File.Delete(_path); } catch { } }
 
+    [Theory]
+    [InlineData(20_000, "XBlock", 3, false)]
+    [InlineData(8_347_697, "XXBlock", 1022, true)]
+    public void InvalidDataBlockIndex_ReportsOperationAndTreeBounds(
+        int payloadLength,
+        string expectedRootBlock,
+        int expectedBlockCount,
+        bool expectXBlockDetails)
+    {
+        var file = NewStore();
+        var tree = new DataTree(file);
+        tree.AppendData(new byte[payloadLength]);
+
+        int invalidIndex = tree.DataBlockCount;
+        Assert.Equal(expectedBlockCount, invalidIndex);
+
+        ArgumentException readError = Assert.Throws<ArgumentException>(
+            () => tree.GetDataBlock(invalidIndex));
+        AssertInvalidDataBlockIndexDetails(
+            readError,
+            "GetDataBlock",
+            invalidIndex,
+            expectedRootBlock,
+            expectedBlockCount,
+            expectXBlockDetails);
+
+        ArgumentException updateError = Assert.Throws<ArgumentException>(
+            () => tree.UpdateDataBlock(invalidIndex, Array.Empty<byte>()));
+        AssertInvalidDataBlockIndexDetails(
+            updateError,
+            "UpdateDataBlock",
+            invalidIndex,
+            expectedRootBlock,
+            expectedBlockCount,
+            expectXBlockDetails);
+    }
+
+    [Fact]
+    public void InvalidDataBlockIndex_ReportsTheObserved3337BlockBoundary()
+    {
+        var file = NewStore();
+        var tree = new DataTree(file);
+        const int expectedBlockCount = 3337;
+        int payloadLength = (expectedBlockCount - 1) * DataBlock.MaximumDataLength + 1;
+        using var payload = new MemoryStream(new byte[payloadLength], writable: false);
+        tree.AppendData(payload, payloadLength);
+
+        Assert.Equal(expectedBlockCount, tree.DataBlockCount);
+        Assert.IsType<XXBlock>(tree.RootBlock);
+        Assert.Equal(1, tree.GetDataBlock(expectedBlockCount - 1).DataLength);
+
+        ArgumentException error = Assert.Throws<ArgumentException>(
+            () => tree.GetDataBlock(expectedBlockCount));
+
+        Assert.Contains("index 3337", error.Message);
+        Assert.Contains("caller=", error.Message);
+        Assert.DoesNotContain("caller=unknown", error.Message);
+        Assert.DoesNotContain("caller=DataTree.GetDataBlock", error.Message);
+        Assert.Contains("root=XXBlock", error.Message);
+        Assert.Contains("availableDataBlocks=3337", error.Message);
+        Assert.Contains("xBlockIndex=3", error.Message);
+        Assert.Contains("xBlockCount=4", error.Message);
+        Assert.Contains("indexWithinXBlock=274", error.Message);
+        Assert.Contains("xBlockDataBlocks=274", error.Message);
+    }
+
+    [Theory]
+    [InlineData(1022)]
+    [InlineData(3337)]
+    public void AppendAfterSave_RefreshesXXBlockReference(int blockCount)
+    {
+        var file = NewStore();
+        var tree = new DataTree(file);
+        tree.AppendData(new byte[blockCount * DataBlock.MaximumDataLength]);
+        Assert.IsType<XXBlock>(tree.RootBlock);
+        Assert.Equal(blockCount, tree.DataBlockCount);
+
+        tree.SaveChanges();
+        ulong oldChildID = ((XXBlock)tree.RootBlock).rgbid[^1].Value;
+
+        tree.AddDataBlock(new byte[] { 0x5A });
+
+        Assert.Equal(blockCount + 1, tree.DataBlockCount);
+        Assert.NotEqual(oldChildID, ((XXBlock)tree.RootBlock).rgbid[^1].Value);
+        Assert.Equal(new byte[] { 0x5A }, tree.GetDataBlock(blockCount).Data);
+    }
+
+    [Theory]
+    [InlineData(1023)]
+    [InlineData(3337)]
+    public void DeleteAfterSave_RefreshesXXBlockReference(int blockCount)
+    {
+        var file = NewStore();
+        var tree = new DataTree(file);
+        tree.AppendData(new byte[blockCount * DataBlock.MaximumDataLength]);
+        tree.SaveChanges();
+        ulong oldChildID = ((XXBlock)tree.RootBlock).rgbid[^1].Value;
+
+        tree.DeleteLastDataBlock();
+
+        Assert.Equal(blockCount - 1, tree.DataBlockCount);
+        Assert.NotEqual(oldChildID, ((XXBlock)tree.RootBlock).rgbid[^1].Value);
+        Assert.Equal(DataBlock.MaximumDataLength, tree.GetDataBlock(blockCount - 2).DataLength);
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(4)]
+    [InlineData(1022)]
+    public void Clear_RemovesAllBlocks(int blockCount)
+    {
+        var file = NewStore();
+        var tree = new DataTree(file);
+        tree.AppendData(new byte[blockCount * DataBlock.MaximumDataLength]);
+
+        tree.Clear();
+
+        Assert.Equal(0, tree.DataBlockCount);
+        Assert.Null(tree.RootBlock);
+    }
+
+    [Fact]
+    public void HeapOnNode_InvalidBlockIndexIncludesHeapContext()
+    {
+        var file = NewStore();
+        var tree = new DataTree(file);
+        tree.AppendData(new byte[DataBlock.MaximumDataLength * 2 + 1]);
+        var heap = new HeapOnNode(tree);
+        var invalidHeapID = new HeapID((ushort)tree.DataBlockCount, 1);
+
+        InvalidDataException error = Assert.Throws<InvalidDataException>(
+            () => heap.GetHeapItem(invalidHeapID));
+
+        Assert.Contains($"blockIndex={tree.DataBlockCount}", error.Message);
+        Assert.Contains($"{tree.DataBlockCount} data blocks", error.Message);
+        Assert.Contains("Invalid data block index", error.InnerException.Message);
+    }
+
+    private static void AssertInvalidDataBlockIndexDetails(
+        ArgumentException error,
+        string operation,
+        int invalidIndex,
+        string rootBlock,
+        int availableDataBlocks,
+        bool expectXBlockDetails)
+    {
+        Assert.Contains($"index {invalidIndex}", error.Message);
+        Assert.Contains($"for {operation}", error.Message);
+        Assert.Contains("caller=", error.Message);
+        Assert.Contains($"root={rootBlock}", error.Message);
+        Assert.Contains($"availableDataBlocks={availableDataBlocks}", error.Message);
+
+        if (expectXBlockDetails)
+        {
+            Assert.Contains("xBlockIndex=1", error.Message);
+            Assert.Contains("xBlockCount=2", error.Message);
+            Assert.Contains("indexWithinXBlock=1", error.Message);
+            Assert.Contains("xBlockDataBlocks=1", error.Message);
+        }
+    }
+
     [Fact]
     public void IncrementalPersist_LeafIsBbtIndexedAndReadable_BeforeTransactionCommit()
     {

@@ -8,6 +8,7 @@
  */
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Text;
 using Utilities;
 
@@ -97,7 +98,19 @@ namespace PSTFileFormat
 
         private HeapOnNodeBlockData GetBlockDataUnbuffered(int blockIndex)
         {
-            DataBlock block = DataTree.GetDataBlock(blockIndex);
+            DataBlock block;
+            try
+            {
+                block = DataTree.GetDataBlock(blockIndex);
+            }
+            catch (ArgumentException ex) when (ex.ParamName == "dataBlockIndex")
+            {
+                throw new InvalidDataException(
+                    $"HeapOnNode requested blockIndex={blockIndex}, but its data tree has "
+                    + $"{DataTree.DataBlockCount} data blocks.",
+                    ex);
+            }
+
             if (blockIndex == 0)
             {
                 HeapOnNodeFirstBlockData heapFirstBlock = new HeapOnNodeFirstBlockData(block.Data);

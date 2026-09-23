@@ -276,7 +276,7 @@ namespace PSTFileFormat
                 }
                 int blockIndex = (int)(rowIndex / m_rowsPerBlock);
                 int inBlockRowIndex = (int)(rowIndex % m_rowsPerBlock);
-                DataBlock block = m_subnodeRows.DataTree.GetDataBlock(blockIndex);
+                DataBlock block = GetRowDataBlock(blockIndex, rowIndex, nameof(GetRowBytes));
                 int offset = inBlockRowIndex * rowLength;
 
                 Array.Copy(block.Data, offset, result, 0, rowLength);
@@ -314,7 +314,7 @@ namespace PSTFileFormat
                 }
                 int blockIndex = (int)(rowIndex / m_rowsPerBlock);
                 int inBlockRowIndex = (int)(rowIndex % m_rowsPerBlock);
-                DataBlock block = m_subnodeRows.DataTree.GetDataBlock(blockIndex);
+                DataBlock block = GetRowDataBlock(blockIndex, rowIndex, nameof(SetRowBytes));
                 int offset = inBlockRowIndex * rowLength;
 
                 Array.Copy(rowBytes, 0, block.Data, offset, rowLength);
@@ -411,7 +411,7 @@ namespace PSTFileFormat
             }
             else
             {
-                DataBlock dataBlock = m_subnodeRows.DataTree.GetDataBlock(blockIndex);
+                DataBlock dataBlock = GetRowDataBlock(blockIndex, rowIndex, nameof(TrimLastRowFromNode));
                 byte[] newRows = new byte[rowIndexInBlock * RowLength];
                 Array.Copy(dataBlock.Data, newRows, newRows.Length);
                 m_subnodeRows.DataTree.UpdateDataBlock(blockIndex, newRows);
@@ -657,7 +657,7 @@ namespace PSTFileFormat
             }
             else
             {
-                DataBlock block = m_subnodeRows.DataTree.GetDataBlock(blockIndex);
+                DataBlock block = GetRowDataBlock(blockIndex, rowIndex, nameof(AddRowToSubnode));
                 int offset = rowIndexInBlock * RowLength;
 
                 byte[] oldRows = block.Data;
@@ -668,6 +668,23 @@ namespace PSTFileFormat
 
                 block.Data = newRows;
                 m_subnodeRows.DataTree.UpdateDataBlock(blockIndex, block.Data);
+            }
+        }
+
+        private DataBlock GetRowDataBlock(int blockIndex, int rowIndex, string operation)
+        {
+            DataTree dataTree = m_subnodeRows.DataTree;
+            try
+            {
+                return dataTree.GetDataBlock(blockIndex);
+            }
+            catch (ArgumentException ex) when (ex.ParamName == "dataBlockIndex")
+            {
+                string context =
+                    $"TableContext.{operation} failed (rowIndex={rowIndex}, rowCount={RowCount}, "
+                    + $"rowLength={RowLength}, rowsPerBlock={m_rowsPerBlock}, "
+                    + $"dataTreeBlocks={dataTree.DataBlockCount}).";
+                throw new InvalidDataException($"{context} {ex.Message}", ex);
             }
         }
         #endregion

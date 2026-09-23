@@ -8,6 +8,7 @@
  */
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Text;
 using Utilities;
@@ -88,7 +89,11 @@ namespace PSTFileFormat
                 }
                 else
                 {
-                    throw new ArgumentException("Invalid data block index");
+                    throw CreateInvalidDataBlockIndexException(
+                        nameof(GetDataBlock),
+                        dataBlockIndex,
+                        rootBlock,
+                        rootBlock.NumberOfDataBlocks);
                 }
             }
             else // XXBlock
@@ -109,7 +114,14 @@ namespace PSTFileFormat
                     }
                     else
                     {
-                        throw new ArgumentException("Invalid data block index");
+                        throw CreateInvalidDataBlockIndexException(
+                            nameof(GetDataBlock),
+                            dataBlockIndex,
+                            rootBlock,
+                            DataBlockCount,
+                            $"xBlockIndex={xBlockIndex}, xBlockCount={rootBlock.NumberOfXBlocks}, "
+                                + $"indexWithinXBlock={dataBlockIndexInXBlock}, "
+                                + $"xBlockDataBlocks={xBlock.NumberOfDataBlocks}");
                     }
                 }
                 else
@@ -164,7 +176,11 @@ namespace PSTFileFormat
                 }
                 else
                 {
-                    throw new ArgumentException("Invalid data block index");
+                    throw CreateInvalidDataBlockIndexException(
+                        nameof(UpdateDataBlock),
+                        dataBlockIndex,
+                        rootBlock,
+                        rootBlock.NumberOfDataBlocks);
                 }
             }
             else // XXBlock
@@ -211,7 +227,14 @@ namespace PSTFileFormat
                     }
                     else
                     {
-                        throw new ArgumentException("Invalid data block index");
+                        throw CreateInvalidDataBlockIndexException(
+                            nameof(UpdateDataBlock),
+                            dataBlockIndex,
+                            rootBlock,
+                            DataBlockCount,
+                            $"xBlockIndex={xBlockIndex}, xBlockCount={rootBlock.NumberOfXBlocks}, "
+                                + $"indexWithinXBlock={dataBlockIndexInXBlock}, "
+                                + $"xBlockDataBlocks={xBlock.NumberOfDataBlocks}");
                     }
                 }
                 else
@@ -219,6 +242,48 @@ namespace PSTFileFormat
                     throw new ArgumentException("Invalid XBlock index");
                 }
             }
+        }
+
+        private static ArgumentException CreateInvalidDataBlockIndexException(
+            string operation,
+            int dataBlockIndex,
+            Block rootBlock,
+            int availableDataBlocks,
+            string xBlockDetails = null)
+        {
+            string nestedBlockDetails = string.IsNullOrWhiteSpace(xBlockDetails)
+                ? string.Empty
+                : $", {xBlockDetails}";
+
+            string message =
+                $"Invalid data block index {dataBlockIndex} for {operation} "
+                + $"(caller={GetCallingMethod()}, root={rootBlock.GetType().Name}, "
+                + $"availableDataBlocks={availableDataBlocks}{nestedBlockDetails}).";
+
+            return new ArgumentException(message, nameof(dataBlockIndex));
+        }
+
+        private static string GetCallingMethod()
+        {
+            StackFrame[] frames = new StackTrace(false).GetFrames();
+            if (frames == null)
+            {
+                return "unknown";
+            }
+
+            foreach (StackFrame frame in frames)
+            {
+                System.Reflection.MethodBase method = frame.GetMethod();
+                if (method == null || method.DeclaringType == typeof(DataTree))
+                {
+                    continue;
+                }
+
+                string typeName = method.DeclaringType?.Name ?? "unknown";
+                return $"{typeName}.{method.Name}";
+            }
+
+            return "unknown";
         }
 
         public void AddDataBlock(byte[] blockData)
@@ -289,7 +354,9 @@ namespace PSTFileFormat
             {
                 XXBlock rootBlock = (XXBlock)m_rootBlock;
 
-                BlockID lastXBlockID = rootBlock.rgbid[rootBlock.NumberOfXBlocks - 1];
+                int lastXBlockIndex = rootBlock.NumberOfXBlocks - 1;
+                BlockID lastXBlockID = rootBlock.rgbid[lastXBlockIndex];
+                ulong previousXBlockID = lastXBlockID.Value;
                 XBlock lastXBlock = (XBlock)GetBlock(lastXBlockID);
 
                 if (lastXBlock.NumberOfDataBlocks < XBlock.MaximumNumberOfDataBlocks)
@@ -297,6 +364,10 @@ namespace PSTFileFormat
                     lastXBlock.rgbid.Add(block.BlockID);
                     lastXBlock.lcbTotal += (uint)blockData.Length;
                     UpdateBlock(lastXBlock);
+                    if (lastXBlock.BlockID.Value != previousXBlockID)
+                    {
+                        rootBlock.rgbid[lastXBlockIndex] = lastXBlock.BlockID;
+                    }
 
                     rootBlock.lcbTotal += (uint)blockData.Length;
                     UpdateBlock(rootBlock);
@@ -342,16 +413,26 @@ namespace PSTFileFormat
                 DeleteBlock(dataBlock);
 
                 rootBlock.rgbid.RemoveAt(dataBlockIndex);
-                // Update the total length
-                uint totalLength = (uint)(rootBlock.lcbTotal - currentDataLength);
-                rootBlock.lcbTotal = totalLength;
-                UpdateBlock(rootBlock);
+                if (rootBlock.NumberOfDataBlocks == 0)
+                {
+                    DeleteBlock(rootBlock);
+                    m_rootBlock = null;
+                }
+                else
+                {
+                    // Update the total length
+                    uint totalLength = (uint)(rootBlock.lcbTotal - currentDataLength);
+                    rootBlock.lcbTotal = totalLength;
+                    UpdateBlock(rootBlock);
+                }
             }
             else // XXBlock
             {
                 XXBlock rootBlock = (XXBlock)m_rootBlock;
 
-                BlockID lastXBlockID = rootBlock.rgbid[rootBlock.NumberOfXBlocks - 1];
+                int lastXBlockIndex = rootBlock.NumberOfXBlocks - 1;
+                BlockID lastXBlockID = rootBlock.rgbid[lastXBlockIndex];
+                ulong previousXBlockID = lastXBlockID.Value;
                 XBlock lastXBlock = (XBlock)GetBlock(lastXBlockID);
                 if (lastXBlock.NumberOfDataBlocks > 1)
                 {
@@ -367,6 +448,10 @@ namespace PSTFileFormat
                     uint xBlockTotalLength = (uint)(lastXBlock.lcbTotal - currentDataLength);
                     lastXBlock.lcbTotal = xBlockTotalLength;
                     UpdateBlock(lastXBlock);
+                    if (lastXBlock.BlockID.Value != previousXBlockID)
+                    {
+                        rootBlock.rgbid[lastXBlockIndex] = lastXBlock.BlockID;
+                    }
 
                     uint totalLength = (uint)(rootBlock.lcbTotal - currentDataLength);
                     rootBlock.lcbTotal = totalLength;
@@ -381,10 +466,17 @@ namespace PSTFileFormat
                     DeleteBlock(dataBlock);
                     DeleteBlock(lastXBlock);
 
-                    int lastXBlockIndex = rootBlock.rgbid.Count - 1;
                     rootBlock.rgbid.RemoveAt(lastXBlockIndex);
-                    rootBlock.lcbTotal = (uint)(rootBlock.lcbTotal - currentDataLength);
-                    UpdateBlock(rootBlock);
+                    if (rootBlock.NumberOfXBlocks == 0)
+                    {
+                        DeleteBlock(rootBlock);
+                        m_rootBlock = null;
+                    }
+                    else
+                    {
+                        rootBlock.lcbTotal = (uint)(rootBlock.lcbTotal - currentDataLength);
+                        UpdateBlock(rootBlock);
+                    }
                 }
             }
         }
@@ -615,7 +707,7 @@ namespace PSTFileFormat
         public void Clear()
         {
             // delete extra blocks
-            for (int index = 0; index < DataBlockCount; index++)
+            while (DataBlockCount > 0)
             {
                 DeleteLastDataBlock();
             }

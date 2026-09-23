@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.6] — 2026-09-23
+
+### Diagnostics
+- Invalid PST data-block index errors now report the attempted operation and index, root block type,
+  caller, available data-block count, and XBlock child-index details when applicable. Table-row
+  access failures also report the row index, row count, row size, and expected rows per block; heap
+  access failures report the requested block and heap data-tree size.
+
+### Fixed
+- Appending to a persisted XXBlock now refreshes its child Block ID in the root, keeping large data trees readable.
+- Removing a leaf from a persisted XXBlock now refreshes that root reference too.
+- Clearing a data tree now removes every block and resets the empty root.
+
 ## [0.3.5] — 2026-09-10
 
 ### Added
